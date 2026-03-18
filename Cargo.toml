@@ -1,0 +1,25 @@
+[package]
+name = "packetty"
+version = "0.1.0"
+edition = "2024"
+authors = ["Matt Allen matt@graynode.net"]
+license = "BSD-3-Clause"
+description = "A terminal UI for USB 2.0 protocol analysis using Cynthion."
+
+[dependencies]
+ratatui = { version = "0.30.0", features = ["serde"] }
+crossterm = "0.29"
+tokio = { version = "1.50", features = ["full"] }
+nusb = { version = "0.2.3", features = ["tokio"] }
+anyhow = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+futures-util = "0.3"
+chrono = { version = "0.4", features = ["clock"] }
+num-format = "0.4"
+num_enum = "0.7"
+bitfield = "0.19"
+itertools = "0.14"
+hex = "0.4"
+log = "0.4"
+tui-file-explorer = "0.6.6"
