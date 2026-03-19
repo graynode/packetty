@@ -3,6 +3,7 @@ use crate::dbg_log;
 use crate::models::{FlatRow, TreeItem, TransactionKind, UsbDeviceInfo,
                     flat_row_count, flat_index_resolve, flat_top_row_index,
                     flat_rows_window, hex_ascii_dump, bytes_to_text_hints};
+use crate::plugins::PluginManager;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, VecDeque};
@@ -24,6 +25,7 @@ pub enum AppState {
 pub enum ActiveView {
     Traffic,
     Devices,
+    Plugins,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +78,13 @@ pub struct App {
     /// Scroll offset for the device tree.
     pub device_scroll: usize,
 
+    // Plugin view
+    pub plugin_manager: PluginManager,
+    /// Index of the selected plugin in the plugin list.
+    pub plugin_selected: usize,
+    /// Scroll offset into the selected plugin's rendered lines.
+    pub plugin_scroll: usize,
+
     device_check_counter: usize,
     /// `true` when the user has pressed `g` once; a second `g` goes to top.
     g_pending: bool,
@@ -89,6 +98,8 @@ pub struct App {
     pub file_explorer: Option<FileExplorer>,
     /// Pcap path queued for loading (set by LoadFile dialog, consumed by update()).
     pub pending_load: Option<std::path::PathBuf>,
+    /// State to restore if the file dialog is cancelled.
+    pub file_dialog_return: AppState,
 
     // Search
     /// `true` while the user is typing a `/` search query.
@@ -106,6 +117,12 @@ pub struct App {
 impl App {
     pub async fn new() -> Result<Self> {
         let device_manager = CynthionManager::new().await?;
+
+        let mut plugin_manager = PluginManager::new();
+        plugin_manager.register(Box::new(crate::plugins::cdc::CdcPlugin::new()));
+        plugin_manager.register(Box::new(crate::plugins::hid_mouse::HidMousePlugin::new()));
+        plugin_manager.register(Box::new(crate::plugins::hid_keyboard::HidKeyboardPlugin::new()));
+
         Ok(App {
             state: AppState::WaitingForDevice,
             active_view: ActiveView::Traffic,
@@ -124,12 +141,16 @@ impl App {
             device_expanded: HashMap::new(),
             device_selected: 0,
             device_scroll: 0,
+            plugin_manager,
+            plugin_selected: 0,
+            plugin_scroll: 0,
             device_check_counter: 0,
             g_pending: false,
             save_label: None,
             load_label: None,
             file_explorer: None,
             pending_load: None,
+            file_dialog_return: AppState::WaitingForDevice,
             search_mode: false,
             search_input: String::new(),
             search_query: String::new(),
@@ -146,14 +167,28 @@ impl App {
         self.device_manager.load_pcap_file(path).await?;
         self.state = AppState::Capturing;
         self.load_label = Some(label.clone());
+        self.save_label = None;
         self.status_message = format!("Loaded: {label}");
-        // Reset search state for the new file.
+        self.clear_capture_state();
+        Ok(())
+    }
+
+    /// Clear all per-capture UI state so a new file can be loaded cleanly.
+    fn clear_capture_state(&mut self) {
+        self.tree_items.clear();
+        self.usb_devices.clear();
+        self.device_expanded.clear();
+        self.selected_row = None;
+        self.scroll_offset = 0;
+        self.device_selected = 0;
+        self.device_scroll = 0;
         self.search_mode = false;
         self.search_input.clear();
         self.search_query.clear();
         self.search_matches.clear();
         self.search_match_idx = None;
-        Ok(())
+        self.plugin_manager.reset();
+        self.plugin_scroll = 0;
     }
 
     // -----------------------------------------------------------------------
@@ -169,7 +204,7 @@ impl App {
         if key.code == KeyCode::Esc {
             if self.state == AppState::LoadFile {
                 self.file_explorer = None;
-                self.state = AppState::WaitingForDevice;
+                self.state = self.file_dialog_return;
                 return false;
             }
             return true;
@@ -181,13 +216,7 @@ impl App {
             AppState::WaitingForDevice | AppState::Connecting => {
                 // `o` opens the file-load dialog from the waiting screen.
                 if key.code == KeyCode::Char('o') && key.modifiers.is_empty() {
-                    let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    self.file_explorer = Some(
-                        FileExplorer::builder(start)
-                            .allow_extension("pcap")
-                            .build(),
-                    );
-                    self.state = AppState::LoadFile;
+                    self.open_file_dialog(AppState::WaitingForDevice);
                 }
             }
             AppState::SpeedSelection => self.handle_speed_input(key),
@@ -204,9 +233,10 @@ impl App {
     }
 
     fn handle_load_file_input(&mut self, key: KeyEvent) {
+        let return_state = self.file_dialog_return;
         let explorer = match self.file_explorer.as_mut() {
             Some(e) => e,
-            None => { self.state = AppState::WaitingForDevice; return; }
+            None => { self.state = return_state; return; }
         };
         match explorer.handle_key(key) {
             ExplorerOutcome::Selected(path) => {
@@ -217,10 +247,21 @@ impl App {
             }
             ExplorerOutcome::Dismissed => {
                 self.file_explorer = None;
-                self.state = AppState::WaitingForDevice;
+                self.state = return_state;
             }
             _ => {}
         }
+    }
+
+    fn open_file_dialog(&mut self, return_to: AppState) {
+        let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        self.file_explorer = Some(
+            FileExplorer::builder(start)
+                .allow_extension("pcap")
+                .build(),
+        );
+        self.file_dialog_return = return_to;
+        self.state = AppState::LoadFile;
     }
 
     fn handle_speed_input(&mut self, key: KeyEvent) {
@@ -259,8 +300,13 @@ impl App {
             KeyCode::Tab => {
                 self.active_view = match self.active_view {
                     ActiveView::Traffic => ActiveView::Devices,
-                    ActiveView::Devices => ActiveView::Traffic,
+                    ActiveView::Devices => ActiveView::Plugins,
+                    ActiveView::Plugins => ActiveView::Traffic,
                 };
+            }
+            // `o` opens the file dialog to load a (new) pcap while capturing.
+            KeyCode::Char('o') if key.modifiers.is_empty() => {
+                self.open_file_dialog(AppState::Capturing);
             }
             // `/` opens search — only available when reviewing a loaded file (not live capture).
             KeyCode::Char('/') if self.load_label.is_some() && key.modifiers.is_empty() => {
@@ -284,6 +330,7 @@ impl App {
             _ => match self.active_view {
                 ActiveView::Traffic => self.handle_traffic_nav(key),
                 ActiveView::Devices => self.handle_device_nav(key),
+                ActiveView::Plugins => self.handle_plugin_nav(key),
             },
         }
     }
@@ -586,6 +633,57 @@ impl App {
         }
     }
 
+    fn handle_plugin_nav(&mut self, key: KeyEvent) {
+        let n_plugins = self.plugin_manager.len();
+        if n_plugins == 0 { return; }
+
+        match key.code {
+            // Select previous / next plugin in the list
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.plugin_selected > 0 {
+                    self.plugin_selected -= 1;
+                    self.plugin_scroll = 0;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.plugin_selected + 1 < n_plugins {
+                    self.plugin_selected += 1;
+                    self.plugin_scroll = 0;
+                }
+            }
+            // Scroll content pane
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let step = (self.page_size / 2).max(1);
+                self.plugin_scroll = self.plugin_scroll.saturating_add(step);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let step = (self.page_size / 2).max(1);
+                self.plugin_scroll = self.plugin_scroll.saturating_sub(step);
+            }
+            KeyCode::PageDown => {
+                self.plugin_scroll = self.plugin_scroll.saturating_add(self.page_size);
+            }
+            KeyCode::PageUp => {
+                self.plugin_scroll = self.plugin_scroll.saturating_sub(self.page_size);
+            }
+            KeyCode::Char('g') if key.modifiers.is_empty() => {
+                if self.g_pending {
+                    self.plugin_scroll = 0;
+                    self.g_pending = false;
+                } else {
+                    self.g_pending = true;
+                    return;
+                }
+            }
+            KeyCode::Char('G') => {
+                // Scroll to bottom — clamp happens in the UI renderer
+                self.plugin_scroll = usize::MAX / 2;
+            }
+            _ => { self.g_pending = false; }
+        }
+        self.g_pending = false;
+    }
+
     fn clamp_scroll(&mut self, flat_len: usize) {
         let page = self.page_size.max(1);
         if let Some(sel) = self.selected_row {
@@ -656,12 +754,14 @@ impl App {
             AppState::Capturing => {
                 if let Some(txns) = self.device_manager.get_new_transactions().await? {
                     let auto_scroll = self.selected_row.is_none();
+                    // Refresh device list once per batch.
+                    self.usb_devices = self.device_manager.discovered_devices();
                     for txn in txns {
+                        // Feed transaction to plugins before consuming it.
+                        self.plugin_manager.on_transaction(&txn, &self.usb_devices);
                         let item = TreeItem::from_transaction(txn);
                         self.tree_items.push_back(item);
                     }
-                    // Refresh device list after each batch.
-                    self.usb_devices = self.device_manager.discovered_devices();
                     // Auto-scroll to bottom when nothing is selected.
                     if auto_scroll {
                         let flat_len = flat_row_count(&self.tree_items);

@@ -9,6 +9,8 @@ use crate::app::{App, AppState, ActiveView};
 use crate::models::{TransactionKind, UsbDeviceInfo, UsbConfigInfo, UsbInterfaceInfo, UsbEndpointInfo, hex_ascii_dump};
 use std::collections::HashMap;
 
+const PLUGIN_LIST_WIDTH: u16 = 28;
+
 // ---------------------------------------------------------------------------
 // Top-level dispatcher
 // ---------------------------------------------------------------------------
@@ -131,6 +133,7 @@ fn draw_capture(f: &mut Frame, main: Rect, status: Rect, app: &mut App) {
     match app.active_view {
         ActiveView::Traffic => draw_traffic_view(f, content_area, app),
         ActiveView::Devices => draw_devices_view(f, content_area, app),
+        ActiveView::Plugins => draw_plugins_view(f, content_area, app),
     }
 
     // If search mode is active, replace the status bar with a search input bar.
@@ -155,7 +158,7 @@ fn draw_capture(f: &mut Frame, main: Rect, status: Rect, app: &mut App) {
         app.status_message.clone()
     };
     let hint = format!(
-        "Tab=views  {}  j/k=↑↓  Ctrl+d/u=½pg  G/gg=last/first  {}  q=quit  txns={}  pkts={}",
+        "Tab=views  {}  o=open  j/k=↑↓  Ctrl+d/u=½pg  G/gg=last/first  {}  q=quit  txns={}  pkts={}",
         if app.load_label.is_some() { "/=search  n/p=next/prev" } else { "s=speed  Ctrl+S=save" },
         if app.load_label.is_none() { "h/l=←→" } else { "" },
         app.transaction_count(),
@@ -165,15 +168,23 @@ fn draw_capture(f: &mut Frame, main: Rect, status: Rect, app: &mut App) {
 }
 
 fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
-    let traffic_style = if app.active_view == ActiveView::Traffic {
-        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+    let active_style = Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let inactive_style = Style::default().fg(Color::DarkGray);
+
+    let traffic_style = if app.active_view == ActiveView::Traffic { active_style } else { inactive_style };
+    let devices_style = if app.active_view == ActiveView::Devices { active_style } else { inactive_style };
+    let plugins_active = app.plugin_manager.active_count() > 0;
+    let plugins_style = if app.active_view == ActiveView::Plugins {
+        active_style
+    } else if plugins_active {
+        inactive_style.fg(Color::Yellow)
     } else {
-        Style::default().fg(Color::DarkGray)
+        inactive_style
     };
-    let devices_style = if app.active_view == ActiveView::Devices {
-        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+    let plugins_label = if plugins_active {
+        format!(" Plugins ({}) ", app.plugin_manager.active_count())
     } else {
-        Style::default().fg(Color::DarkGray)
+        " Plugins ".to_string()
     };
 
     let tabs = Line::from(vec![
@@ -181,6 +192,8 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" Traffic ", traffic_style),
         Span::raw("  "),
         Span::styled(" Devices ", devices_style),
+        Span::raw("  "),
+        Span::styled(plugins_label, plugins_style),
         Span::raw("  "),
         Span::styled("Tab to switch", Style::default().fg(Color::DarkGray)),
     ]);
@@ -235,8 +248,11 @@ fn draw_packet_tree(f: &mut Frame, area: Rect, app: &mut App) {
 
         let label = format!("{ts_prefix}{connector}{}", row.label);
 
-        let base_color = App::kind_color(row.kind);
-        // Highlight the REC indicator in red when saving.
+        let base_color = if row.crc_error {
+            Color::Red
+        } else {
+            App::kind_color(row.kind)
+        };
         let style = if *selected {
             Style::default()
                 .fg(Color::Black)
@@ -352,6 +368,89 @@ fn draw_devices_view(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     f.render_widget(List::new(items), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Plugins view  (left: plugin list,  right: selected plugin content)
+// ---------------------------------------------------------------------------
+
+fn draw_plugins_view(f: &mut Frame, area: Rect, app: &mut App) {
+    let plugins = app.plugin_manager.plugins();
+
+    if plugins.is_empty() {
+        let block = Block::default().title(" Plugins ").borders(Borders::ALL);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No plugins registered.",
+                Style::default().fg(Color::DarkGray),
+            ))).block(block),
+            area,
+        );
+        return;
+    }
+
+    // Split into plugin list (left) + content pane (right).
+    let [list_area, content_area] = Layout::horizontal([
+        Constraint::Length(PLUGIN_LIST_WIDTH),
+        Constraint::Min(1),
+    ]).areas(area);
+
+    // ── Plugin list ──────────────────────────────────────────────────────────
+    let list_block = Block::default()
+        .title(" Plugins ")
+        .borders(Borders::ALL);
+
+    let list_items: Vec<ListItem> = plugins.iter().enumerate().map(|(i, p)| {
+        let selected = i == app.plugin_selected;
+        let active   = p.is_active();
+        let indicator = if active { "●" } else { "○" };
+        let indicator_color = if active { Color::Green } else { Color::DarkGray };
+        let name_color = if selected { Color::Black } else if active { Color::White } else { Color::DarkGray };
+        let bg = if selected { Color::Cyan } else { Color::Reset };
+
+        // Truncate name to fit the pane.
+        let max_name = PLUGIN_LIST_WIDTH as usize - 5;
+        let name: String = p.name().chars().take(max_name).collect();
+
+        let line = Line::from(vec![
+            Span::styled(format!(" {indicator} "), Style::default().fg(indicator_color).bg(bg)),
+            Span::styled(name, Style::default().fg(name_color).bg(bg)
+                .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() })),
+        ]);
+        ListItem::new(line)
+    }).collect();
+
+    f.render_widget(List::new(list_items).block(list_block), list_area);
+
+    // ── Content pane ─────────────────────────────────────────────────────────
+    let selected_plugin = &plugins[app.plugin_selected.min(plugins.len() - 1)];
+    let content_block = Block::default()
+        .title(format!(" {} ", selected_plugin.name()))
+        .borders(Borders::ALL);
+    let inner = content_block.inner(content_area);
+    f.render_widget(content_block, content_area);
+
+    let all_lines: Vec<Line> = selected_plugin
+        .render_lines()
+        .into_iter()
+        .map(|l| l.into_ratatui_line())
+        .collect();
+
+    let max_scroll = all_lines.len().saturating_sub(inner.height as usize);
+    app.plugin_scroll = app.plugin_scroll.min(max_scroll);
+    // Keep page_size in sync with visible height for Ctrl+d/u.
+    app.page_size = inner.height as usize;
+
+    let visible: Vec<Line> = all_lines
+        .into_iter()
+        .skip(app.plugin_scroll)
+        .take(inner.height as usize)
+        .collect();
+
+    f.render_widget(
+        Paragraph::new(visible).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 // ---------------------------------------------------------------------------

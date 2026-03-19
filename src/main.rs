@@ -3,6 +3,7 @@ mod ui;
 mod backend;
 mod models;
 mod pcap;
+mod plugins;
 
 use anyhow::Result;
 use app::App;

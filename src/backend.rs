@@ -336,9 +336,14 @@ impl DeviceTracker {
                 let desc_type  = w_value_hi;
                 let desc_index = w_value_lo;
 
-                // Response is the second Data packet (DATA stage payload).
-                let Some(resp_pkt) = data_pkts.get(1) else { return };
-                let data = &resp_pkt.raw_bytes;
+                // Response data may be split across multiple IN transactions
+                // (e.g. device descriptor fetched 8 bytes at a time during
+                // early enumeration before wMaxPacketSize0 is known).
+                // Concatenate all data packets after the SETUP packet.
+                let resp_data: Vec<u8> = data_pkts[1..].iter()
+                    .flat_map(|p| p.raw_bytes.iter().copied())
+                    .collect();
+                let data: &[u8] = &resp_data;
                 if data.is_empty() { return; }
 
                 let dev = self.devices.entry(addr).or_insert_with(|| UsbDeviceInfo {
@@ -760,17 +765,25 @@ impl TransactionBuilder {
                 if self.pending_sof.is_empty() {
                     self.sof_first_ts = raw.timestamp_ns;
                 }
-                let crc5_sof = if raw.bytes.len() >= 3 {
-                    format!("\nCRC5: 0x{:02X}", (raw.bytes[2] >> 3) & 0x1F)
+                let (crc5_sof_valid, crc5_sof) = if raw.bytes.len() >= 3 {
+                    let valid = check_crc5(&raw.bytes);
+                    let received = (raw.bytes[2] >> 3) & 0x1F;
+                    (Some(valid), format!("\nCRC5: 0x{:02X}{}", received, crc_annotation(valid)))
                 } else {
-                    String::new()
+                    (None, String::new())
+                };
+                let sof_label = if crc5_sof_valid == Some(false) {
+                    format!("SOF   frame={frame:04}  [CRC ERR]")
+                } else {
+                    format!("SOF   frame={frame:04}")
                 };
                 self.pending_sof.push(PacketItem {
                     packet_type: PacketType::Sof,
-                    label: format!("SOF   frame={frame:04}"),
+                    label: sof_label,
                     details: format!("PID: SOF (0xA5)\nFrame number: {frame}{crc5_sof}"),
                     raw_bytes: Vec::new(),
                     timestamp_ns: raw.timestamp_ns,
+                    crc_valid: crc5_sof_valid,
                 });
             }
 
@@ -787,20 +800,28 @@ impl TransactionBuilder {
 
                 let (addr, ep) = decode_token(&raw.bytes);
                 let pname = pid_name(raw.pid);
-                let crc5_tok = if raw.bytes.len() >= 3 {
-                    format!("\nCRC5: 0x{:02X}", (raw.bytes[2] >> 3) & 0x1F)
+                let (crc5_tok_valid, crc5_tok) = if raw.bytes.len() >= 3 {
+                    let valid = check_crc5(&raw.bytes);
+                    let received = (raw.bytes[2] >> 3) & 0x1F;
+                    (Some(valid), format!("\nCRC5: 0x{:02X}{}", received, crc_annotation(valid)))
                 } else {
-                    String::new()
+                    (None, String::new())
+                };
+                let tok_label = if crc5_tok_valid == Some(false) {
+                    format!("{pname}   dev={addr}  ep={ep}  [CRC ERR]")
+                } else {
+                    format!("{pname}   dev={addr}  ep={ep}")
                 };
                 let pkt = PacketItem {
                     packet_type: PacketType::Other,
-                    label: format!("{pname}   dev={addr}  ep={ep}"),
+                    label: tok_label,
                     details: format!(
                         "PID: {pname} (0x{:02X})\nAddr: {addr}  EP: {ep}\nData: {}{crc5_tok}",
                         raw.pid, hex_str(&raw.bytes)
                     ),
                     raw_bytes: Vec::new(),
                     timestamp_ns: raw.timestamp_ns,
+                    crc_valid: crc5_tok_valid,
                 };
                 self.inner = InnerState::HaveToken {
                     pid: raw.pid, addr, ep, pkt, timestamp_ns: raw.timestamp_ns,
@@ -816,22 +837,30 @@ impl TransactionBuilder {
                     Vec::new()
                 };
                 let pname = pid_name(raw.pid);
-                let crc16 = if raw.bytes.len() >= 3 {
+                let (crc16_valid, crc16_str) = if raw.bytes.len() >= 3 {
+                    let valid = check_crc16(&raw.bytes);
                     let lo = raw.bytes[raw.bytes.len() - 2];
                     let hi = raw.bytes[raw.bytes.len() - 1];
-                    format!("\nCRC16: 0x{:04X}", u16::from_le_bytes([lo, hi]))
+                    let val = u16::from_le_bytes([lo, hi]);
+                    (Some(valid), format!("\nCRC16: 0x{:04X}{}", val, crc_annotation(valid)))
                 } else {
-                    String::new()
+                    (None, String::new())
+                };
+                let data_label = if crc16_valid == Some(false) {
+                    format!("{pname}   {payload_len} bytes  [CRC ERR]")
+                } else {
+                    format!("{pname}   {payload_len} bytes")
                 };
                 let data_pkt = PacketItem {
                     packet_type: PacketType::Data,
-                    label: format!("{pname}   {payload_len} bytes"),
+                    label: data_label,
                     details: format!(
-                        "PID: {pname} (0x{:02X})\nLength: {payload_len} bytes\nPayload: {}{crc16}",
+                        "PID: {pname} (0x{:02X})\nLength: {payload_len} bytes\nPayload: {}{crc16_str}",
                         raw.pid, hex_str(&payload)
                     ),
                     raw_bytes: payload.clone(),
                     timestamp_ns: raw.timestamp_ns,
+                    crc_valid: crc16_valid,
                 };
                 let old = std::mem::replace(&mut self.inner, InnerState::Idle);
                 self.inner = match old {
@@ -863,6 +892,7 @@ impl TransactionBuilder {
                     details: format!("PID: {hs_name} (0x{:02X})\n(no CRC — handshake packet)", raw.pid),
                     raw_bytes: Vec::new(),
                     timestamp_ns: raw.timestamp_ns,
+                    crc_valid: None,
                 };
 
                 let old = std::mem::replace(&mut self.inner, InnerState::Idle);
@@ -1067,15 +1097,18 @@ impl TransactionBuilder {
                         if let Some(t) = self.flush_xfer() { out.push(t); }
                     }
                 } else {
+                    let has_crc_error = pkts_have_crc_error(&txn.packets);
+                    let crc_tag = if has_crc_error { "  [CRC ERR]" } else { "" };
                     out.push(TransactionInfo {
                         kind: TransactionKind::Other,
                         label: format!(
-                            "{}  dev={}  ep={}",
-                            pid_name(txn.tok_pid), txn.addr, txn.ep
+                            "{}  dev={}  ep={}{}",
+                            pid_name(txn.tok_pid), txn.addr, txn.ep, crc_tag
                         ),
                         details: build_details(txn.addr, txn.ep, &txn.packets),
                         packets: txn.packets,
                         timestamp_ns: txn.timestamp_ns,
+                        has_crc_error,
                     });
                 }
             }
@@ -1122,12 +1155,15 @@ impl TransactionBuilder {
         let last  = frame_from_sof(&pkts[n - 1]);
         let ts = self.sof_first_ts;
         self.sof_first_ts = 0;
+        let has_crc_error = pkts_have_crc_error(&pkts);
+        let crc_tag = if has_crc_error { "  [CRC ERR]" } else { "" };
         Some(TransactionInfo {
             kind: TransactionKind::SofGroup,
-            label: format!("SOF   frames {first:04}–{last:04}  ({n} packet{})", if n==1{""} else{"s"}),
+            label: format!("SOF   frames {first:04}–{last:04}  ({n} packet{}){crc_tag}", if n==1{""} else{"s"}),
             details: format!("Start-of-Frame group\nFrames: {first}–{last}\nCount: {n}"),
             packets: pkts,
             timestamp_ns: ts,
+            has_crc_error,
         })
     }
 
@@ -1186,6 +1222,68 @@ impl TransactionBuilder {
 
 // ── Helper functions ───────────────────────────────────────────────────────
 
+// ── USB CRC validation ─────────────────────────────────────────────────────
+
+/// Validate CRC5 for token and SOF packets.
+///
+/// Processes all 16 bits of the two post-PID bytes (11 data bits + 5 CRC bits)
+/// through the USB CRC5 engine using the reflected (LSB-first) algorithm:
+///   polynomial: G(X) = X^5 + X^2 + 1, reflected = 0x14
+///   initial value: 0x1F (all ones)
+///
+/// The USB spec states the residual as 01100b in wire (LSB-first) order.
+/// In the reflected register that equals 0x06 (bit-reverse of 0x0C over 5 bits).
+fn check_crc5(bytes: &[u8]) -> bool {
+    if bytes.len() < 3 { return false; }
+    // bytes[1..2] hold the 11 data bits (ADDR+ENDP for token, frame# for SOF)
+    // followed by the 5 transmitted CRC bits, all packed LSB-first across 16 bits.
+    let combined = u16::from_le_bytes([bytes[1], bytes[2]]);
+    let mut crc: u8 = 0x1F;
+    for i in 0..16 {
+        let feedback = (((combined >> i) as u8) ^ crc) & 1;
+        crc >>= 1;
+        if feedback != 0 {
+            crc ^= 0x14; // reflected G(X) = X^5 + X^2 + 1
+        }
+    }
+    // USB CRC5 residual in the reflected domain: 0x06
+    // (the spec's "01100b" in LSB-first wire order = 0x06 as a register value)
+    crc == 0x06
+}
+
+/// Validate CRC16 for data packets (DATA0/DATA1/DATA2/MDATA).
+///
+/// Processes bytes[1..] (payload + the two transmitted CRC bytes) through the
+/// reflected (LSB-first) CRC-16/USB algorithm:
+///   polynomial: G(X) = X^16 + X^15 + X^2 + 1 (0x8005), reflected = 0xA001
+///   initial value: 0xFFFF
+///
+/// The USB spec states the residual as 1000000000001101b (0x800D) in MSB-first
+/// notation.  In the reflected register that equals 0xB001
+/// (bit-reverse of 0x800D over 16 bits).
+fn check_crc16(bytes: &[u8]) -> bool {
+    if bytes.len() < 3 { return false; }
+    let mut crc: u16 = 0xFFFF;
+    for &byte in &bytes[1..] { // skip PID, include both CRC bytes
+        crc ^= byte as u16;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xA001; // reflected 0x8005
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    // USB CRC16 residual in the reflected domain: 0xB001
+    // (the spec's 0x800D written MSB-first bit-reverses to 0xB001 in the register)
+    crc == 0xB001
+}
+
+/// Format a CRC value with a validity indicator for the details pane.
+fn crc_annotation(valid: bool) -> &'static str {
+    if valid { "  ✓" } else { "  ✗ INVALID" }
+}
+
 /// Decode ADDR and ENDP from a USB token packet (bytes after PID).
 fn decode_token(bytes: &[u8]) -> (u8, u8) {
     if bytes.len() < 3 {
@@ -1228,13 +1326,20 @@ fn hex_str(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
 }
 
+/// Returns `true` if any packet in the slice has an invalid CRC.
+fn pkts_have_crc_error(pkts: &[PacketItem]) -> bool {
+    pkts.iter().any(|p| p.crc_valid == Some(false))
+}
+
 fn standalone_data_txn(pkt: PacketItem, timestamp_ns: u64) -> TransactionInfo {
+    let has_crc_error = pkt.crc_valid == Some(false);
     TransactionInfo {
         kind: TransactionKind::Other,
         label: pkt.label.clone(),
         details: pkt.details.clone(),
         packets: vec![pkt],
         timestamp_ns,
+        has_crc_error,
     }
 }
 
@@ -1247,9 +1352,11 @@ fn build_control_txn(
     stalled: bool,
     ts: u64,
 ) -> TransactionInfo {
+    let has_crc_error = pkts_have_crc_error(packets);
     let status = if stalled { "[STALL]" } else { "[ACK]" };
     let retry  = if nak_count > 0 { format!("  ({nak_count} retries)") } else { String::new() };
-    let label  = format!("Control  {setup_label}  dev={addr}{retry}  {status}");
+    let crc_tag = if has_crc_error { "  [CRC ERR]" } else { "" };
+    let label  = format!("Control  {setup_label}  dev={addr}{retry}  {status}{crc_tag}");
     let details = build_details(addr, ep, packets);
     TransactionInfo {
         kind: TransactionKind::Control,
@@ -1257,6 +1364,7 @@ fn build_control_txn(
         details,
         packets: packets.to_vec(),
         timestamp_ns: ts,
+        has_crc_error,
     }
 }
 
@@ -1269,16 +1377,19 @@ fn build_bulk_txn(
     nak_count: u32,
     ts: u64,
 ) -> TransactionInfo {
-    let dir    = if is_in { "IN " } else { "OUT" };
-    let retry  = if nak_count > 0 { format!("  ({nak_count} retries)") } else { String::new() };
-    let label  = format!("Bulk {dir}  dev={addr}  ep={ep}  {total_bytes} bytes{retry}");
-    let kind   = if is_in { TransactionKind::BulkIn } else { TransactionKind::BulkOut };
+    let has_crc_error = pkts_have_crc_error(packets);
+    let dir     = if is_in { "IN " } else { "OUT" };
+    let retry   = if nak_count > 0 { format!("  ({nak_count} retries)") } else { String::new() };
+    let crc_tag = if has_crc_error { "  [CRC ERR]" } else { "" };
+    let label   = format!("Bulk {dir}  dev={addr}  ep={ep}  {total_bytes} bytes{retry}{crc_tag}");
+    let kind    = if is_in { TransactionKind::BulkIn } else { TransactionKind::BulkOut };
     TransactionInfo {
         kind,
         label,
         details: build_details(addr, ep, packets),
         packets: packets.to_vec(),
         timestamp_ns: ts,
+        has_crc_error,
     }
 }
 

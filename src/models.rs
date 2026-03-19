@@ -113,6 +113,9 @@ pub struct PacketItem {
     pub raw_bytes: Vec<u8>,
     /// Nanoseconds from start of capture for this individual packet.
     pub timestamp_ns: u64,
+    /// CRC validity: `None` = no CRC (handshake), `Some(true)` = valid,
+    /// `Some(false)` = invalid (bit error or corrupted capture).
+    pub crc_valid: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +150,8 @@ pub struct TransactionInfo {
     pub packets: Vec<PacketItem>,
     /// Nanoseconds from the start of capture (first packet of this transaction).
     pub timestamp_ns: u64,
+    /// `true` when at least one packet in this transaction has an invalid CRC.
+    pub has_crc_error: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +173,8 @@ pub struct FlatRow {
     pub kind: TransactionKind,
     /// Nanoseconds from start of capture (inherited from parent for child rows).
     pub timestamp_ns: u64,
+    /// `true` when this row (or any child) has an invalid CRC.
+    pub crc_error: bool,
 }
 
 /// A top-level entry in the captured-traffic tree.
@@ -180,6 +187,8 @@ pub struct TreeItem {
     pub children: Vec<PacketItem>,
     /// Nanoseconds from start of capture.
     pub timestamp_ns: u64,
+    /// `true` when at least one child packet has an invalid CRC.
+    pub has_crc_error: bool,
 }
 
 impl TreeItem {
@@ -191,6 +200,7 @@ impl TreeItem {
             expanded: false,
             children: t.packets,
             timestamp_ns: t.timestamp_ns,
+            has_crc_error: t.has_crc_error,
         }
     }
 
@@ -288,6 +298,7 @@ pub fn flat_rows_window(
                 depth: 0,
                 kind: item.kind,
                 timestamp_ns: item.timestamp_ns,
+                crc_error: item.has_crc_error,
             }));
         }
         gi += 1;
@@ -307,6 +318,7 @@ pub fn flat_rows_window(
                         depth: 1,
                         kind: child_kind(pkt.packet_type),
                         timestamp_ns: pkt.timestamp_ns,
+                        crc_error: pkt.crc_valid == Some(false),
                     }));
                 }
                 gi += 1;
