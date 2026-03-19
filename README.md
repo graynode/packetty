@@ -192,53 +192,13 @@ Press ↓ to select Full-Speed, then Enter
 - Color-coded display for visual clarity
 - Status bar with real-time statistics
 
-## Dependencies
-
-- **ratatui 0.28**: Terminal UI framework for rendering
-- **crossterm 0.28**: Cross-platform terminal backend
-- **tokio 1.36**: Async runtime for I/O operations
-- **nusb 0.2.0**: USB device communication
-- **anyhow 1.0.79**: Error handling and context
-- **async-trait 0.1.89**: Async trait support
-- **serde 1.0**: Serialization framework
-- **futures-util 0.3.21**: Future utilities
-- **chrono 0.4.38**: Time/date handling
-- **num-format 0.4.4**: Number formatting
-- **num_enum 0.7.2**: Enum derivations
-- **bitfield 0.14.0**: Bitfield manipulation
-- **itertools 0.12.1**: Iterator utilities
-- **hex 0.4**: Hex encoding/decoding
-
 ## TODO / Future Improvements
-
-### High Priority
-- [ ] **Real Packet Capture**: Read USB packets from Cynthion device
-  - Implement bulk endpoint reading
-  - Parse USB protocol data
-  - Format as transaction/transfer/packet hierarchy
-
-- [ ] **Packet Decoding**: Interpret USB protocol data
-  - Decode SETUP tokens
-  - Parse data payloads
-  - Identify packet types
-
-- [ ] **USB Speed Control**: Actually set device speed
-  - Send control requests to Cynthion
-  - Handle device responses
-
-### Medium Priority
 - [ ] Packet filtering by endpoint, direction, type
-- [ ] Search/find functionality  
-- [ ] Export to PCAP format
+- [ ] Add unit tests
+- [ ] More complex search/find functionality  
 - [ ] Statistics and metrics display
 - [ ] Configuration file support
 - [ ] Horizontal scrolling for long packet details
-
-### Low Priority
-- [ ] Terminal resize handling improvements
-- [ ] Mouse support
-- [ ] Theme customization
-- [ ] Performance optimization
 
 ## Development Notes
 
@@ -250,33 +210,12 @@ Currently no automated tests. To manually test:
 2. **With device**: Application should detect device and proceed through states
 3. **UI navigation**: Test all keyboard shortcuts in each state
 
-### Code Style
-
-- Uses Rust idioms and best practices
-- Error handling via `anyhow` with context
-- Async/await for non-blocking operations
-- Minimal use of unsafe code (only via nusb/system calls)
-
-### Building for Different Platforms
-
-Linux/macOS:
-```bash
-cargo build --release
-```
-
-Windows (should work automatically):
-```bash
-cargo build --release
-```
-
-The application uses platform-specific retry logic for interface claiming on Windows.
-
 ## License
 
 BSD-3-Clause (same as packetry project)
 
 ## Related Projects
+Packetty is based on the original work from GreatScottGadgets 
 
 - **packetry** (GTK version): https://github.com/greatscottgadgets/packetry
 - **Cynthion device**: https://github.com/greatscottgadgets/cynthion
-- **nusb library**: https://github.com/kevinmehall/nusb
