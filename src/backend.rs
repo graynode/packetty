@@ -760,11 +760,17 @@ impl TransactionBuilder {
                 if self.pending_sof.is_empty() {
                     self.sof_first_ts = raw.timestamp_ns;
                 }
+                let crc5_sof = if raw.bytes.len() >= 3 {
+                    format!("\nCRC5: 0x{:02X}", (raw.bytes[2] >> 3) & 0x1F)
+                } else {
+                    String::new()
+                };
                 self.pending_sof.push(PacketItem {
                     packet_type: PacketType::Sof,
                     label: format!("SOF   frame={frame:04}"),
-                    details: format!("PID: SOF (0xA5)\nFrame number: {frame}"),
+                    details: format!("PID: SOF (0xA5)\nFrame number: {frame}{crc5_sof}"),
                     raw_bytes: Vec::new(),
+                    timestamp_ns: raw.timestamp_ns,
                 });
             }
 
@@ -781,14 +787,20 @@ impl TransactionBuilder {
 
                 let (addr, ep) = decode_token(&raw.bytes);
                 let pname = pid_name(raw.pid);
+                let crc5_tok = if raw.bytes.len() >= 3 {
+                    format!("\nCRC5: 0x{:02X}", (raw.bytes[2] >> 3) & 0x1F)
+                } else {
+                    String::new()
+                };
                 let pkt = PacketItem {
                     packet_type: PacketType::Other,
                     label: format!("{pname}   dev={addr}  ep={ep}"),
                     details: format!(
-                        "PID: {pname} (0x{:02X})\nAddr: {addr}  EP: {ep}\nData: {}",
+                        "PID: {pname} (0x{:02X})\nAddr: {addr}  EP: {ep}\nData: {}{crc5_tok}",
                         raw.pid, hex_str(&raw.bytes)
                     ),
                     raw_bytes: Vec::new(),
+                    timestamp_ns: raw.timestamp_ns,
                 };
                 self.inner = InnerState::HaveToken {
                     pid: raw.pid, addr, ep, pkt, timestamp_ns: raw.timestamp_ns,
@@ -804,14 +816,22 @@ impl TransactionBuilder {
                     Vec::new()
                 };
                 let pname = pid_name(raw.pid);
+                let crc16 = if raw.bytes.len() >= 3 {
+                    let lo = raw.bytes[raw.bytes.len() - 2];
+                    let hi = raw.bytes[raw.bytes.len() - 1];
+                    format!("\nCRC16: 0x{:04X}", u16::from_le_bytes([lo, hi]))
+                } else {
+                    String::new()
+                };
                 let data_pkt = PacketItem {
                     packet_type: PacketType::Data,
                     label: format!("{pname}   {payload_len} bytes"),
                     details: format!(
-                        "PID: {pname} (0x{:02X})\nLength: {payload_len} bytes\nPayload: {}",
+                        "PID: {pname} (0x{:02X})\nLength: {payload_len} bytes\nPayload: {}{crc16}",
                         raw.pid, hex_str(&payload)
                     ),
                     raw_bytes: payload.clone(),
+                    timestamp_ns: raw.timestamp_ns,
                 };
                 let old = std::mem::replace(&mut self.inner, InnerState::Idle);
                 self.inner = match old {
@@ -840,8 +860,9 @@ impl TransactionBuilder {
                         _         => PacketType::Other,
                     },
                     label: hs_name.to_string(),
-                    details: format!("PID: {hs_name} (0x{:02X})", raw.pid),
+                    details: format!("PID: {hs_name} (0x{:02X})\n(no CRC — handshake packet)", raw.pid),
                     raw_bytes: Vec::new(),
+                    timestamp_ns: raw.timestamp_ns,
                 };
 
                 let old = std::mem::replace(&mut self.inner, InnerState::Idle);

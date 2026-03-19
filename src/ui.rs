@@ -215,14 +215,11 @@ fn draw_packet_tree(f: &mut Frame, area: Rect, app: &mut App) {
 
     let items: Vec<ListItem> = rows.iter().map(|(row, selected)| {
         // ── Timestamp prefix ──────────────────────────────────────────────
-        // "3.066331633  " = 13 chars; child rows show blank space instead.
-        let ts_prefix = if row.depth == 0 {
-            let secs  = row.timestamp_ns / 1_000_000_000;
-            let frac  = row.timestamp_ns % 1_000_000_000;
-            format!("{secs}.{frac:09}  ")
-        } else {
-            "             ".to_string()
-        };
+        // "3.066331633  " = 13 chars; shown for every row using that row's
+        // own timestamp (child packets carry their individual arrival time).
+        let secs  = row.timestamp_ns / 1_000_000_000;
+        let frac  = row.timestamp_ns % 1_000_000_000;
+        let ts_prefix = format!("{secs}.{frac:09}  ");
 
         // ── Tree connector ────────────────────────────────────────────────
         // Depth-0: "○──── ▶ " (collapsed) / "○──── ▼ " (expanded) / "○────   "

@@ -111,6 +111,8 @@ pub struct PacketItem {
     /// Raw USB packet bytes (PID + payload, no CRC).  Used for descriptor
     /// parsing; empty for token/handshake packets where we don't need them.
     pub raw_bytes: Vec<u8>,
+    /// Nanoseconds from start of capture for this individual packet.
+    pub timestamp_ns: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +306,7 @@ pub fn flat_rows_window(
                         is_expanded: false,
                         depth: 1,
                         kind: child_kind(pkt.packet_type),
-                        timestamp_ns: item.timestamp_ns,
+                        timestamp_ns: pkt.timestamp_ns,
                     }));
                 }
                 gi += 1;
