@@ -136,7 +136,7 @@ where
         // Drain ALL pending input events each tick to avoid stale queue build-up.
         while crossterm::event::poll(std::time::Duration::from_millis(0))? {
             match event::read()? {
-                event::Event::Key(key) => {
+                event::Event::Key(key)
                     if key.kind == event::KeyEventKind::Press => {
                         if app.handle_input(key) {
                             dbg_log!("quit requested by user");
