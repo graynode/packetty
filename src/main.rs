@@ -48,7 +48,7 @@ fn init_log() {
     let file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/packetry-term.log")
+        .open("packetry-term.log")
         .expect("Cannot open log file");
     LOG_FILE.get_or_init(|| Arc::new(Mutex::new(file)));
     dbg_log!("=== packetry-term started ===");
