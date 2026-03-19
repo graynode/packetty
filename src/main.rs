@@ -137,9 +137,11 @@ where
         while crossterm::event::poll(std::time::Duration::from_millis(0))? {
             match event::read()? {
                 event::Event::Key(key) => {
-                    if app.handle_input(key) {
-                        dbg_log!("quit requested by user");
-                        return Ok(());
+                    if key.kind == event::KeyEventKind::Press => {
+                        if app.handle_input(key) {
+                            dbg_log!("quit requested by user");
+                            return Ok(());
+                        }
                     }
                 }
                 event::Event::Resize(w, h) => {
