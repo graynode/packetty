@@ -142,7 +142,6 @@ where
                             dbg_log!("quit requested by user");
                             return Ok(());
                         }
-                    }
                 }
                 event::Event::Resize(w, h) => {
                     dbg_log!("terminal resize: {w}×{h}");
