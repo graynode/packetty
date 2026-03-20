@@ -797,8 +797,14 @@ enum XferState {
 struct TransactionBuilder {
     inner: InnerState,
     xfer:  XferState,
+    /// SOF packets that arrived with no transfer in progress; flushed as a
+    /// standalone SofGroup node before the next real transaction starts.
     pending_sof: Vec<PacketItem>,
     sof_first_ts: u64,
+    /// SOF packets that arrived while a Control/Bulk transfer was in progress;
+    /// flushed as a single grouped child PacketItem just before the next
+    /// non-SOF packet is added to that transfer.
+    mid_xfer_sof: Vec<PacketItem>,
 }
 
 impl TransactionBuilder {
@@ -808,6 +814,7 @@ impl TransactionBuilder {
             xfer:  XferState::Idle,
             pending_sof: Vec::new(),
             sof_first_ts: 0,
+            mid_xfer_sof: Vec::new(),
         }
     }
 
@@ -822,9 +829,6 @@ impl TransactionBuilder {
                 let frame = if raw.bytes.len() >= 3 {
                     u16::from_le_bytes([raw.bytes[1], raw.bytes[2]]) & 0x7FF
                 } else { 0 };
-                if self.pending_sof.is_empty() {
-                    self.sof_first_ts = raw.timestamp_ns;
-                }
                 let (crc5_sof_valid, crc5_sof) = if raw.bytes.len() >= 3 {
                     let valid = check_crc5(&raw.bytes);
                     let received = (raw.bytes[2] >> 3) & 0x1F;
@@ -837,14 +841,26 @@ impl TransactionBuilder {
                 } else {
                     format!("SOF   frame={frame:04}")
                 };
-                self.pending_sof.push(PacketItem {
+                let sof_pkt = PacketItem {
                     packet_type: PacketType::Sof,
                     label: sof_label,
                     details: format!("PID: SOF (0xA5)\nFrame number: {frame}{crc5_sof}"),
                     raw_bytes: Vec::new(),
                     timestamp_ns: raw.timestamp_ns,
                     crc_valid: crc5_sof_valid,
-                });
+                };
+                // If a transfer is already in progress, buffer the SOF so
+                // consecutive SOFs can be collapsed into a single child node.
+                // Otherwise, accumulate for a standalone SOF-group node.
+                match &self.xfer {
+                    XferState::Idle => {
+                        if self.pending_sof.is_empty() {
+                            self.sof_first_ts = raw.timestamp_ns;
+                        }
+                        self.pending_sof.push(sof_pkt);
+                    }
+                    _ => { self.mid_xfer_sof.push(sof_pkt); }
+                }
             }
 
             // ── Token packets ────────────────────────────────────────────
@@ -1000,6 +1016,9 @@ impl TransactionBuilder {
     // ── Layer 2: feed a completed inner transaction to the transfer machine ─
 
     fn feed_xfer(&mut self, txn: CompletedTxn, out: &mut Vec<TransactionInfo>) {
+        // Flush any mid-transfer SOF packets accumulated since the last triplet.
+        self.drain_mid_xfer_sof();
+
         // ── Isochronous detection ──────────────────────────────────────────
         // Isochronous transfers carry no ACK/NAK handshake.  When flush_inner
         // fires because a new token arrived before any handshake (hs_pid == 0),
@@ -1227,6 +1246,36 @@ impl TransactionBuilder {
         };
     }
 
+    /// Drain any buffered mid-transfer SOF packets into the current transfer's
+    /// packet list, collapsing consecutive SOFs into a single grouped child item.
+    fn drain_mid_xfer_sof(&mut self) {
+        if self.mid_xfer_sof.is_empty() { return; }
+        let pkts = std::mem::take(&mut self.mid_xfer_sof);
+        let n = pkts.len();
+        let first = frame_from_sof(&pkts[0]);
+        let last  = frame_from_sof(&pkts[n - 1]);
+        let ts    = pkts[0].timestamp_ns;
+        let has_crc_error = pkts.iter().any(|p| p.crc_valid == Some(false));
+        let crc_tag = if has_crc_error { "  [CRC ERR]" } else { "" };
+        let grouped = if n == 1 {
+            pkts.into_iter().next().unwrap()
+        } else {
+            PacketItem {
+                packet_type: PacketType::Sof,
+                label:   format!("SOF   frames {first:04}–{last:04}  ({n} packets){crc_tag}"),
+                details: format!("PID: SOF (0xA5)\nFrame numbers: {first}–{last}\nCount: {n}{crc_tag}"),
+                raw_bytes: Vec::new(),
+                timestamp_ns: ts,
+                crc_valid: if has_crc_error { Some(false) } else { None },
+            }
+        };
+        match &mut self.xfer {
+            XferState::Control { all_packets, .. } => all_packets.push(grouped),
+            XferState::Bulk    { all_packets, .. } => all_packets.push(grouped),
+            XferState::Idle => {} // discard — xfer finished before we could drain
+        }
+    }
+
     fn flush_sof_group(&mut self) -> Option<TransactionInfo> {
         if self.pending_sof.is_empty() { return None; }
         let pkts = std::mem::take(&mut self.pending_sof);
@@ -1249,6 +1298,8 @@ impl TransactionBuilder {
 
     /// Flush the in-progress outer transfer.
     fn flush_xfer(&mut self) -> Option<TransactionInfo> {
+        // Flush any trailing mid-transfer SOFs before closing the transfer.
+        self.drain_mid_xfer_sof();
         let xfer = std::mem::replace(&mut self.xfer, XferState::Idle);
         match xfer {
             XferState::Idle => None,
