@@ -331,6 +331,9 @@ pub struct AudioPlugin {
     /// Current playback position in frames (updated by background thread).
     #[cfg(feature = "audio-playback")]
     playback_pos:    Option<Arc<AtomicUsize>>,
+    /// Frame position saved when the user pauses; `None` when stopped or playing.
+    #[cfg(feature = "audio-playback")]
+    paused_frame:    Option<usize>,
 
     // Media events list
     media_events:    Vec<MediaEvent>,
@@ -361,6 +364,8 @@ impl AudioPlugin {
             stop_flag:       None,
             #[cfg(feature = "audio-playback")]
             playback_pos:    None,
+            #[cfg(feature = "audio-playback")]
+            paused_frame:    None,
             media_events:    Vec::new(),
             first_ts_ns:     None,
             events_view:     false,
@@ -377,25 +382,42 @@ impl AudioPlugin {
         false
     }
 
-    fn stop_playback(&mut self) {
+    /// Signal the background thread to stop.  Does NOT clear `paused_frame`.
+    fn signal_stop(&mut self) {
         #[cfg(feature = "audio-playback")]
-        {
-            if let Some(flag) = &self.stop_flag {
-                flag.store(true, Ordering::Relaxed);
-            }
-            if let Some(pos) = &self.playback_pos {
-                pos.store(0, Ordering::Relaxed);
-            }
+        if let Some(flag) = &self.stop_flag {
+            flag.store(true, Ordering::Relaxed);
         }
     }
 
     /// Returns the current playback frame index, or `None` when not playing.
+    /// When paused, returns `paused_frame`.
     fn current_playback_frame(&self) -> Option<usize> {
         #[cfg(feature = "audio-playback")]
-        if self.is_playing() {
-            return self.playback_pos.as_ref().map(|p| p.load(Ordering::Relaxed));
+        {
+            if self.is_playing() {
+                return self.playback_pos.as_ref().map(|p| p.load(Ordering::Relaxed));
+            }
+            return self.paused_frame;
         }
+        #[cfg(not(feature = "audio-playback"))]
         None
+    }
+
+    /// Launch a playback thread starting at `start_frame`.
+    #[cfg(feature = "audio-playback")]
+    fn start_playback_from(&mut self, samples: Vec<i16>, channels: u8, sample_rate: u32, start_frame: usize) {
+        if let Some(f) = &self.stop_flag { f.store(true, Ordering::Relaxed); }
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag2 = flag.clone();
+        let pos = Arc::new(AtomicUsize::new(start_frame));
+        let pos2 = pos.clone();
+        self.stop_flag       = Some(flag);
+        self.playback_pos    = Some(pos);
+        self.paused_frame    = None;
+        self.playback_thread = Some(std::thread::spawn(move || {
+            play_audio(samples, channels, sample_rate, start_frame, flag2, pos2);
+        }));
     }
 
     fn sorted_keys(&self) -> Vec<(u8, u8)> {
@@ -953,7 +975,7 @@ impl UsbPlugin for AudioPlugin {
     }
 
     fn reset(&mut self) {
-        self.stop_playback();
+        self.signal_stop();
         self.events.clear();
         self.devices.clear();
         self.streams.clear();
@@ -967,7 +989,7 @@ impl UsbPlugin for AudioPlugin {
         self.events_scroll   = 0;
         self.pending_nav     = None;
         #[cfg(feature = "audio-playback")]
-        { self.playback_thread = None; self.stop_flag = None; self.playback_pos = None; }
+        { self.playback_thread = None; self.stop_flag = None; self.playback_pos = None; self.paused_frame = None; }
     }
 
     fn is_active(&self) -> bool { !self.events.is_empty() }
@@ -1071,7 +1093,8 @@ impl UsbPlugin for AudioPlugin {
             ]
         } else {
             vec![
-                ("Space",        "Play / stop captured audio"),
+                ("Space",        "Play / pause captured audio"),
+                ("← / →",        "Seek backward / forward 5 seconds"),
                 ("[",            "Select previous stream"),
                 ("]",            "Select next stream"),
                 ("w",            "Save stream to .wav file"),
@@ -1094,11 +1117,16 @@ impl UsbPlugin for AudioPlugin {
                 #[cfg(feature = "audio-playback")]
                 {
                     if self.is_playing() {
-                        self.stop_playback();
-                        if let Some(t) = self.playback_thread.take() {
-                            let _ = t;
-                        }
+                        // Playing → Pause: save position and signal thread to stop.
+                        let saved = self.playback_pos
+                            .as_ref()
+                            .map(|p| p.load(Ordering::Relaxed))
+                            .unwrap_or(0);
+                        self.signal_stop();
+                        self.paused_frame = Some(saved);
                     } else {
+                        // Paused or stopped → resume/start from saved position (or 0).
+                        let start = self.paused_frame.unwrap_or(0);
                         let keys = self.sorted_keys();
                         if keys.is_empty() { return; }
                         let sel = self.selected_idx.min(keys.len() - 1);
@@ -1107,18 +1135,7 @@ impl UsbPlugin for AudioPlugin {
                             let channels    = stream.channels;
                             let sample_rate = stream.sample_rate;
                             if !samples.is_empty() {
-                                if let Some(f) = &self.stop_flag {
-                                    f.store(true, Ordering::Relaxed);
-                                }
-                                let flag  = Arc::new(AtomicBool::new(false));
-                                let flag2 = flag.clone();
-                                let pos   = Arc::new(AtomicUsize::new(0));
-                                let pos2  = pos.clone();
-                                self.stop_flag       = Some(flag);
-                                self.playback_pos    = Some(pos);
-                                self.playback_thread = Some(std::thread::spawn(move || {
-                                    play_audio(samples, channels, sample_rate, flag2, pos2);
-                                }));
+                                self.start_playback_from(samples, channels, sample_rate, start);
                             }
                         }
                     }
@@ -1169,6 +1186,54 @@ impl UsbPlugin for AudioPlugin {
             _ => {}
         }
     }
+
+    fn on_key_code(&mut self, key: crossterm::event::KeyCode) {
+        #[cfg(feature = "audio-playback")]
+        {
+            use crossterm::event::KeyCode;
+            let seek_delta: i64 = match key {
+                KeyCode::Left  => -5,
+                KeyCode::Right =>  5,
+                _ => return,
+            };
+
+            let keys = self.sorted_keys();
+            if keys.is_empty() { return; }
+            let sel = self.selected_idx.min(keys.len() - 1);
+            let (total_frames, channels, sample_rate) = if let Some(s) = self.streams.get(&keys[sel]) {
+                (s.samples.len() / s.channels.max(1) as usize, s.channels, s.sample_rate)
+            } else { return; };
+
+            let seek_frames = (seek_delta * sample_rate as i64).unsigned_abs() as usize;
+            let current = if self.is_playing() {
+                self.playback_pos.as_ref().map(|p| p.load(Ordering::Relaxed)).unwrap_or(0)
+            } else {
+                self.paused_frame.unwrap_or(0)
+            };
+
+            let new_frame = if seek_delta < 0 {
+                current.saturating_sub(seek_frames)
+            } else {
+                (current + seek_frames).min(total_frames.saturating_sub(1))
+            };
+
+            if self.is_playing() {
+                // Restart playback from the new position.
+                let samples = self.streams.get(&keys[sel]).map(|s| s.samples.clone()).unwrap_or_default();
+                self.start_playback_from(samples, channels, sample_rate, new_frame);
+            } else {
+                // Just update the cursor position.
+                self.paused_frame = if new_frame == 0 && self.paused_frame.is_none() {
+                    None
+                } else {
+                    Some(new_frame)
+                };
+            }
+            let _ = (total_frames, channels);
+        }
+        #[cfg(not(feature = "audio-playback"))]
+        let _ = key;
+    }
 }
 
 // ── Waveform renderer ─────────────────────────────────────────────────────────
@@ -1184,19 +1249,21 @@ fn render_waveform(
 ) {
     let total_frames = (stream.samples.len() / stream.channels.max(1) as usize).max(1);
 
-    // Build title with playback position when playing.
+    // Build title with playback position when playing or paused.
     let pos_tag = if let Some(frame) = playback_frame {
         let elapsed = frame as f32 / stream.sample_rate as f32;
-        format!("  ▶ {:.1}s / {:.1}s", elapsed, stream.duration_secs())
+        let icon = if playing { "▶" } else { "⏸" };
+        format!("  {} {:.1}s / {:.1}s", icon, elapsed, stream.duration_secs())
     } else {
         format!("  {:.1}s captured", stream.duration_secs())
     };
     let title = format!(" EP 0x{:02X}{} ", stream.ep_addr, pos_tag);
 
-    let border_color = if playing { Color::Green } else { Color::DarkGray };
+    let paused = !playing && playback_frame.is_some();
+    let border_color = if playing { Color::Green } else if paused { Color::Yellow } else { Color::DarkGray };
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(if playing { Color::Green } else { Color::Cyan }))
+        .title_style(Style::default().fg(if playing { Color::Green } else if paused { Color::Yellow } else { Color::Cyan }))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
 
@@ -1378,13 +1445,15 @@ fn play_audio(
     samples:     Vec<i16>,
     channels:    u8,
     sample_rate: u32,
+    start_frame: usize,
     stop:        Arc<AtomicBool>,
     pos:         Arc<AtomicUsize>,
 ) {
     let total_frames = samples.len() / channels.max(1) as usize;
+    let start_frame  = start_frame.min(total_frames.saturating_sub(1));
     crate::dbg_log!(
-        "play_audio: start — {} samples ({} frames), {} ch, {} Hz",
-        samples.len(), total_frames, channels, sample_rate
+        "play_audio: start — {} samples ({} frames), {} ch, {} Hz, start_frame={}",
+        samples.len(), total_frames, channels, sample_rate, start_frame
     );
 
     let (_stream, handle) = match rodio::OutputStream::try_default() {
@@ -1402,21 +1471,22 @@ fn play_audio(
         }
     };
 
+    // Skip to start_frame by slicing the sample slice.
+    let skip_samples = start_frame * channels.max(1) as usize;
     let source = rodio::buffer::SamplesBuffer::new(
         channels as u16,
         sample_rate,
-        samples,
+        samples[skip_samples..].to_vec(),
     );
     sink.append(source);
     crate::dbg_log!("play_audio: sink started");
 
-    let start = std::time::Instant::now();
+    let wall_start = std::time::Instant::now();
     while !sink.empty() && !stop.load(Ordering::Relaxed) {
-        let frame = (start.elapsed().as_secs_f64() * sample_rate as f64) as usize;
+        let frame = start_frame + (wall_start.elapsed().as_secs_f64() * sample_rate as f64) as usize;
         pos.store(frame.min(total_frames), Ordering::Relaxed);
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
     sink.stop();
-    pos.store(0, Ordering::Relaxed);
     crate::dbg_log!("play_audio: done (stop_flag={})", stop.load(Ordering::Relaxed));
 }

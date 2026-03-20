@@ -4,6 +4,7 @@ pub mod hid_keyboard;
 pub mod audio;
 
 use crate::models::{TransactionInfo, UsbDeviceInfo};
+use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -111,6 +112,10 @@ pub trait UsbPlugin: Send {
     /// playback).
     fn on_key(&mut self, _key: char) {}
 
+    /// Called for special keys (arrows, etc.) that cannot be represented as
+    /// a single `char`.  Default implementation is a no-op.
+    fn on_key_code(&mut self, _key: KeyCode) {}
+
     /// Returns plugin-specific key bindings shown in the help popup.
     /// Each entry is `(key_label, description)`.
     fn help_keys(&self) -> Vec<(&'static str, &'static str)> { vec![] }
@@ -174,6 +179,13 @@ impl PluginManager {
     pub fn dispatch_key(&mut self, idx: usize, key: char) {
         if let Some(p) = self.plugins.get_mut(idx) {
             p.on_key(key);
+        }
+    }
+
+    /// Forward a special key code to the selected plugin's `on_key_code` handler.
+    pub fn dispatch_key_code(&mut self, idx: usize, key: KeyCode) {
+        if let Some(p) = self.plugins.get_mut(idx) {
+            p.on_key_code(key);
         }
     }
 

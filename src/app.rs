@@ -753,6 +753,10 @@ impl App {
                     self.handle_plugin_nav_request(nav);
                 }
             }
+            // Forward Left/Right arrows to the active plugin (seek).
+            KeyCode::Left | KeyCode::Right if key.modifiers.is_empty() => {
+                self.plugin_manager.dispatch_key_code(self.plugin_selected, key.code);
+            }
             _ => { self.g_pending = false; }
         }
         self.g_pending = false;
