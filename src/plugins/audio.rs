@@ -244,8 +244,9 @@ impl CapturedStream {
                 2 => i16::from_le_bytes([data[i], data[i + 1]]),
                 3 => {
                     let raw = i32::from_le_bytes([data[i], data[i + 1], data[i + 2], 0]);
-                    // 24-bit signed → shift to 16-bit
-                    ((raw << 8) >> 24) as i16
+                    // Sign-extend the 24-bit value by shifting its sign bit into bit 31,
+                    // then take the top 16 bits.  >> 24 would keep only 8 bits (256× too quiet).
+                    ((raw << 8) >> 16) as i16
                 }
                 4 => {
                     let raw = i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
