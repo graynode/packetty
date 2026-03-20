@@ -1,8 +1,10 @@
 pub mod cdc;
 pub mod hid_mouse;
 pub mod hid_keyboard;
+pub mod audio;
 
 use crate::models::{TransactionInfo, UsbDeviceInfo};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -73,11 +75,30 @@ pub trait UsbPlugin: Send {
     fn reset(&mut self);
 
     /// Returns the lines to display in this plugin's content pane.
+    /// Used as fallback when `render_custom` returns false.
     fn render_lines(&self) -> Vec<PluginLine>;
 
     /// Returns `true` when the plugin has seen relevant activity.
     /// Used to show an indicator on the Plugins tab.
     fn is_active(&self) -> bool;
+
+    /// Optional fully-custom rendering into `area`.  Return `true` if the
+    /// plugin handled the render itself; return `false` to fall back to the
+    /// default `render_lines` paragraph renderer.
+    ///
+    /// `scroll` is the current vertical scroll offset (lines to skip).
+    fn render_custom(&self, _f: &mut ratatui::Frame<'_>, _area: Rect, _scroll: usize) -> bool {
+        false
+    }
+
+    /// Called when a key is pressed while this plugin's content pane is
+    /// focused.  Plugins can use this for interactive controls (e.g. audio
+    /// playback).
+    fn on_key(&mut self, _key: char) {}
+
+    /// Returns plugin-specific key bindings shown in the help popup.
+    /// Each entry is `(key_label, description)`.
+    fn help_keys(&self) -> Vec<(&'static str, &'static str)> { vec![] }
 }
 
 // ---------------------------------------------------------------------------
@@ -124,5 +145,12 @@ impl PluginManager {
     /// Number of plugins that currently have active data.
     pub fn active_count(&self) -> usize {
         self.plugins.iter().filter(|p| p.is_active()).count()
+    }
+
+    /// Forward a keypress to the selected plugin's `on_key` handler.
+    pub fn dispatch_key(&mut self, idx: usize, key: char) {
+        if let Some(p) = self.plugins.get_mut(idx) {
+            p.on_key(key);
+        }
     }
 }

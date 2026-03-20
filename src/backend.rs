@@ -50,8 +50,24 @@ const PID_PRE:   u8 = 0x3C; // also ERR in HS
 // ── Cynthion State byte ────────────────────────────────────────────────────
 // Bit 0   : enable capture
 // Bits 2:1: speed  (High=0, Full=1, Low=2, Auto=3 — matches our Speed enum)
+// Bit 3   : target_c_vbus_en
+// Bit 4   : control_vbus_en
+// Bit 5   : aux_vbus_en
+// Bit 6   : target_a_discharge  (active-low VBUS; set when VBUS is OFF)
+// Bit 7   : power_control_enable (must be set for bits 3-6 to take effect)
 fn state_byte(speed: Speed, enable: bool) -> u8 {
     ((speed as u8) << 1) | (enable as u8)
+}
+
+fn apply_vbus(state: u8, vbus_on: bool) -> u8 {
+    // Clear existing VBUS/power bits, then re-apply.
+    let base = state & 0x07; // keep only enable + speed
+    let power_bits: u8 = if vbus_on {
+        (1 << 7) | (1 << 3) // power_control_enable + target_c_vbus_en
+    } else {
+        (1 << 7) | (1 << 6) // power_control_enable + target_a_discharge
+    };
+    base | power_bits
 }
 
 // ── DeviceInfo ─────────────────────────────────────────────────────────────
@@ -74,6 +90,14 @@ pub struct CynthionManager {
     /// Tracks USB devices discovered from captured enumeration traffic.
     device_tracker: DeviceTracker,
 
+    // ── VBUS control ─────────────────────────────────────────────────────────
+    /// Current VBUS state (TARGET-C).
+    pub vbus_enabled: bool,
+    /// Channel to send updated state bytes to the running capture task.
+    state_tx: Option<mpsc::UnboundedSender<u8>>,
+    /// Speed saved from open_device so we can rebuild the state byte on toggle.
+    capture_speed: Option<Speed>,
+
     // ── PCAP save ────────────────────────────────────────────────────────────
     /// Channel receiving raw (bytes, timestamp_ns) from the capture task.
     raw_rx: Option<mpsc::UnboundedReceiver<(Vec<u8>, u64)>>,
@@ -90,6 +114,9 @@ impl CynthionManager {
             txn_rx: None,
             capture_handle: None,
             device_tracker: DeviceTracker::new(),
+            vbus_enabled: false,
+            state_tx: None,
+            capture_speed: None,
             raw_rx: None,
             pcap_writer: None,
             save_path: None,
@@ -140,7 +167,7 @@ impl CynthionManager {
         }
         let iface_num = iface_num.context("Could not find Cynthion analyzer interface")?;
         dbg_log!("open_device: claiming interface {iface_num}");
-        let interface = device.claim_interface(iface_num).await
+        let interface = device.detach_and_claim_interface(iface_num).await
             .context("Failed to claim interface")?;
         dbg_log!("open_device: interface claimed successfully");
 
@@ -157,11 +184,29 @@ impl CynthionManager {
         self.raw_rx = Some(raw_rx);
 
         let state = state_byte(speed, true);
-        let handle = tokio::task::spawn(run_capture(interface, state, tx, raw_tx));
+        self.capture_speed = Some(speed);
+        self.vbus_enabled = false;
+
+        let (state_tx, state_rx) = mpsc::unbounded_channel::<u8>();
+        self.state_tx = Some(state_tx);
+
+        let handle = tokio::task::spawn(run_capture(interface, state, tx, raw_tx, state_rx));
         self.capture_handle = Some(handle);
 
         dbg_log!("open_device: capture task spawned");
         Ok(())
+    }
+
+    /// Toggle VBUS (TARGET-C) on or off and send the updated state to the
+    /// running capture task.  Returns `Ok(new_state)` or `Err` if not capturing.
+    pub fn toggle_vbus(&mut self) -> Result<bool> {
+        let speed = self.capture_speed.context("Not capturing")?;
+        let state_tx = self.state_tx.as_ref().context("No capture task")?;
+        self.vbus_enabled = !self.vbus_enabled;
+        let new_state = apply_vbus(state_byte(speed, true), self.vbus_enabled);
+        state_tx.send(new_state).ok();
+        dbg_log!("toggle_vbus: vbus={} state=0x{new_state:02X}", self.vbus_enabled);
+        Ok(self.vbus_enabled)
     }
 
     /// Returns any transactions the capture task has produced since the last call,
@@ -229,6 +274,9 @@ impl CynthionManager {
         }
         self.device_tracker = DeviceTracker::new();
         self.raw_rx = None;
+        self.state_tx = None;
+        self.capture_speed = None;
+        self.vbus_enabled = false;
 
         let (tx, rx) = mpsc::channel::<TransactionInfo>(4096);
         self.txn_rx = Some(rx);
@@ -509,13 +557,7 @@ fn parse_config_descriptor(data: &[u8]) -> Option<UsbConfigInfo> {
 
 // ── Capture background task ────────────────────────────────────────────────
 
-async fn run_capture(
-    interface: Interface,
-    state: u8,
-    tx: mpsc::Sender<TransactionInfo>,
-    raw_tx: mpsc::UnboundedSender<(Vec<u8>, u64)>,
-) {
-    // Tell the Cynthion to start capturing at the requested speed.
+async fn send_state(interface: &Interface, state: u8) {
     let ctrl = ControlOut {
         control_type: ControlType::Vendor,
         recipient: Recipient::Interface,
@@ -525,9 +567,19 @@ async fn run_capture(
         data: &[],
     };
     if let Err(e) = interface.control_out(ctrl, Duration::from_secs(1)).await {
-        dbg_log!("capture: start-capture control transfer failed: {e}");
-        return;
+        dbg_log!("capture: state control transfer failed: {e}");
     }
+}
+
+async fn run_capture(
+    interface: Interface,
+    state: u8,
+    tx: mpsc::Sender<TransactionInfo>,
+    raw_tx: mpsc::UnboundedSender<(Vec<u8>, u64)>,
+    mut state_rx: mpsc::UnboundedReceiver<u8>,
+) {
+    // Tell the Cynthion to start capturing at the requested speed.
+    send_state(&interface, state).await;
     dbg_log!("capture: started (state=0x{state:02X})");
 
     // Obtain the bulk IN endpoint.
@@ -547,27 +599,35 @@ async fn run_capture(
     let mut builder = TransactionBuilder::new();
 
     loop {
-        let completion = endpoint.next_complete().await;
-        let ok = completion.status.is_ok();
-        if ok {
-            parser.push(&completion.buffer);
-            while let Some(pkt) = parser.next_packet() {
-                // Forward raw bytes to the PCAP save channel (non-blocking drop if full).
-                let _ = raw_tx.send((pkt.bytes.clone(), pkt.timestamp_ns));
-                for txn in builder.push_packet(pkt) {
-                    if tx.send(txn).await.is_err() {
-                        dbg_log!("capture: receiver dropped, stopping");
-                        return;
-                    }
-                }
+        tokio::select! {
+            // ── New state byte from main thread (VBUS toggle, etc.) ──────
+            Some(new_state) = state_rx.recv() => {
+                send_state(&interface, new_state).await;
             }
-        } else {
-            dbg_log!("capture: transfer error: {:?}", completion.status);
+
+            // ── Next bulk IN completion ───────────────────────────────────
+            completion = endpoint.next_complete() => {
+                let ok = completion.status.is_ok();
+                if ok {
+                    parser.push(&completion.buffer);
+                    while let Some(pkt) = parser.next_packet() {
+                        let _ = raw_tx.send((pkt.bytes.clone(), pkt.timestamp_ns));
+                        for txn in builder.push_packet(pkt) {
+                            if tx.send(txn).await.is_err() {
+                                dbg_log!("capture: receiver dropped, stopping");
+                                return;
+                            }
+                        }
+                    }
+                } else {
+                    dbg_log!("capture: transfer error: {:?}", completion.status);
+                }
+                // Resubmit the buffer for the next transfer.
+                let mut buf = completion.buffer;
+                buf.set_requested_len(READ_LEN);
+                endpoint.submit(buf);
+            }
         }
-        // Resubmit the buffer for the next transfer.
-        let mut buf = completion.buffer;
-        buf.set_requested_len(READ_LEN);
-        endpoint.submit(buf);
     }
 }
 
@@ -940,6 +1000,26 @@ impl TransactionBuilder {
     // ── Layer 2: feed a completed inner transaction to the transfer machine ─
 
     fn feed_xfer(&mut self, txn: CompletedTxn, out: &mut Vec<TransactionInfo>) {
+        // ── Isochronous detection ──────────────────────────────────────────
+        // Isochronous transfers carry no ACK/NAK handshake.  When flush_inner
+        // fires because a new token arrived before any handshake (hs_pid == 0),
+        // and there is a non-empty data phase, treat it as isochronous.
+        // Emit immediately without disturbing any in-progress Bulk/Control state
+        // (iso and bulk can coexist on different endpoints of the same device).
+        if txn.hs_pid == 0
+            && (txn.tok_pid == PID_IN || txn.tok_pid == PID_OUT)
+            && txn.data_len > 0
+        {
+            out.push(build_iso_txn(
+                txn.tok_pid == PID_IN,
+                txn.addr, txn.ep,
+                &txn.packets,
+                txn.data_len,
+                txn.timestamp_ns,
+            ));
+            return;
+        }
+
         // SETUP always begins a new control transfer.
         if txn.tok_pid == PID_SETUP {
             if let Some(t) = self.flush_xfer() { out.push(t); }
@@ -1386,6 +1466,27 @@ fn build_bulk_txn(
     TransactionInfo {
         kind,
         label,
+        details: build_details(addr, ep, packets),
+        packets: packets.to_vec(),
+        timestamp_ns: ts,
+        has_crc_error,
+    }
+}
+
+/// Emit a completed isochronous transfer as a `TransactionInfo`.
+fn build_iso_txn(
+    is_in: bool,
+    addr: u8, ep: u8,
+    packets: &[PacketItem],
+    data_len: usize,
+    ts: u64,
+) -> TransactionInfo {
+    let has_crc_error = pkts_have_crc_error(packets);
+    let dir     = if is_in { "IN " } else { "OUT" };
+    let crc_tag = if has_crc_error { "  [CRC ERR]" } else { "" };
+    TransactionInfo {
+        kind: TransactionKind::Isochronous,
+        label: format!("Isoch {dir}  dev={addr}  ep={ep}  {data_len} bytes{crc_tag}"),
         details: build_details(addr, ep, packets),
         packets: packets.to_vec(),
         timestamp_ns: ts,

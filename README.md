@@ -35,7 +35,14 @@ Press `Tab` to switch to the Devices view. Packetty reconstructs full USB device
 ### Open PCAP File
 ![Open PCAP file browser](media/open-pcap-view.png)
 
-Press `o` from the waiting screen to open the built-in file browser (`tui-file-explorer`). Navigate the filesystem with arrow keys, filter to `.pcap` files only, and press `Enter` or `l` to load. Press `/` to search for a file by name. Captures can also be loaded directly from the command line with `--load <file.pcap>`.
+Press `o` from the waiting screen or the speed-selection screen to open the built-in file browser (`tui-file-explorer`). Navigate the filesystem with arrow keys, filter to `.pcap` files only, and press `Enter` or `l` to load. Press `/` to search for a file by name. Captures can also be loaded directly from the command line with `--load <file.pcap>`.
+
+---
+
+### Plugins View — USB Audio
+![USB Audio plugin](media/uac-plugin.png)
+
+Press `Tab` twice to reach the Plugins view. The left column lists all registered plugins; the selected plugin's analysis fills the right pane. The **USB Audio** plugin shown here has decoded a full UAC 1.0 topology from the device's configuration descriptor — input/output terminals, feature units with mute/volume controls, and two audio streaming interfaces — and is displaying 43 seconds of captured isochronous PCM audio as a live scrolling waveform. Use `Space` to play/stop, `[`/`]` to switch between captured streams, and `w` to export the selected stream to a `.wav` file.
 
 ---
 
@@ -43,9 +50,27 @@ Press `o` from the waiting screen to open the built-in file browser (`tui-file-e
 
 - **Device Detection**: Automatically detects connected Cynthion devices (VID: 0x1d50, PID: 0x615b)
 - **USB Speed Selection**: Choose between High-Speed (480 Mbps), Full-Speed (12 Mbps), Low-Speed (1.5 Mbps), or Auto
-- **Hierarchical Packet View**: Display captured USB packets in an expandable tree structure
-- **Real-time Capture**: Monitor USB traffic as packets arrive
-- **Keyboard Navigation**: Intuitive keyboard controls for all UI elements
+- **Hierarchical Transaction Tree**: Each node is a complete USB transfer (Control, Bulk IN/OUT, Interrupt, Isochronous, SOF group); expand with `Enter` or `→` to see individual packets with timestamps and CRC validity
+- **Real-time Capture**: Monitor USB traffic as packets arrive, with auto-scroll and live PCAP recording (`Ctrl+S`)
+- **PCAP Load/Save**: Open saved captures from the waiting screen, speed-selection screen, or while capturing; export at any time with `Ctrl+S`
+- **Vim-style Search**: Press `/` while reviewing a loaded capture to search across labels, decoded fields, hex bytes, and UTF-16LE strings
+- **Device Descriptor Reconstruction**: Automatically parses `GET_DESCRIPTOR` responses into a browsable device→configuration→interface→endpoint tree
+- **VBUS Control**: Toggle bus power on the TARGET-C port with `v` during live capture
+- **Keyboard Navigation**: Full vim-style navigation (`j`/`k`, `g`/`G`, `Ctrl+d`/`u`) across all views
+- **Context-sensitive Help**: Press `?` in any state to see available key bindings
+
+### Plugins
+
+Plugins observe every transaction in real time and present protocol-specific analysis in the Plugins tab. Four plugins ship by default:
+
+| Plugin | Class | What it shows |
+|---|---|---|
+| **CDC Serial Monitor** | 0x02 CDC-Data | Live serial data stream decoded from bulk IN/OUT transfers on CDC-Data interfaces |
+| **HID Mouse** | 0x03 HID | Decoded button state and X/Y/wheel deltas from interrupt IN reports |
+| **HID Keyboard** | 0x03 HID | Decoded modifier keys and keycodes from interrupt IN reports, with a scrolling key-event log |
+| **USB Audio** | 0x01 Audio | Full UAC 1.0 topology (input/output terminals, feature/mixer/selector units), streaming format (sample rate, bit depth, channel count), live braille waveform of captured PCM audio, and playback via the system audio device |
+
+The USB Audio plugin requires the `audio-playback` feature flag for actual playback (`cargo build --features audio-playback`). WAV export works without it.
 
 ## Building
 
@@ -77,13 +102,14 @@ cargo run
   - `Ctrl+C` - Exit application
 
 #### 2. Speed Selection
-Once device is connected, you'll be prompted to select USB speed:
+Once a device is connected, you'll be prompted to select USB speed:
 - **Display**: List of available USB speeds
 - **Current options**: High-Speed, Full-Speed, Low-Speed, Auto
 - **Actions available**:
-  - `↑` / `↓` - Navigate speed options (highlighted in blue)
+  - `↑` / `↓` - Navigate speed options
   - `Enter` - Confirm selection and begin capture
-  - `q` - Cancel and return to waiting for device
+  - `o` - Open a pcap file without starting a capture
+  - `Esc` / `q` - Return to waiting for device
 
 #### 3. Connecting
 Brief intermediate state while establishing device connection
@@ -100,11 +126,16 @@ Active packet capture and display
 - **Bottom**: Status bar showing packet count, selected packet, current speed
 
 **Keyboard controls**:
-- `↑` / `↓` - Navigate through packets (changes selection)
-- `←` / `→` - Collapse/expand selected packet details
-- `s` - Change USB speed (returns to Speed Selection)
-- `q` - Quit application
-- `Ctrl+C` - Force quit
+- `↑`/`↓` / `j`/`k` - Navigate transactions
+- `→`/`l` / `←`/`h` - Expand / collapse; `Enter` toggles
+- `Tab` - Cycle views (Traffic → Devices → Plugins)
+- `s` - Return to speed selection (live capture only)
+- `v` - Toggle VBUS on TARGET-C (live capture only)
+- `o` - Open a different pcap file
+- `Ctrl+S` - Start / stop PCAP recording (live capture only)
+- `/` - Search (loaded file only); `n`/`p` next/previous match
+- `?` - Toggle help popup
+- `q` / `Esc` - Quit
 
 #### 5. Error State
 If an error occurs (e.g., device disconnected, communication failure):
@@ -147,58 +178,17 @@ Press ↓ to select Full-Speed, then Enter
 
 ### Modules
 
-- **main.rs**: Application entry point and event loop
-  - Terminal setup and cleanup
-  - Main event handling loop
-  - Async update coordination
-
-- **app.rs**: Core application state machine
-  - AppState enum (WaitingForDevice, SpeedSelection, Connecting, Capturing, Error)
-  - Input handling (keyboard events)
-  - Async updates from device
-
-- **ui.rs**: Ratatui-based terminal UI
-  - Screen rendering for each state
-  - Layout management
-  - Styling and colors
-
-- **backend.rs**: Cynthion device communication
-  - CynthionManager for device lifecycle
-  - Device detection via nusb
-  - Interface claiming and management
-  - Packet simulation for demo
-
-- **models.rs**: Data structures
-  - TreeItem: Hierarchical packet representation
-  - PacketInfo: Packet metadata
-  - PacketTree: Tree data structure
-  - PacketDirection: In/Out indicator
-
-### Key Components
-
-**CynthionManager**:
-- Searches for Cynthion device (VID: 0x1d50, PID: 0x615b)
-- Opens device interface (CLASS: 0xFF, SUBCLASS: 0x10, PROTOCOL: 0x01)
-- Manages device state and connection
-
-**App State Machine**:
-- Handles all state transitions
-- Processes keyboard input
-- Manages async device operations
-- Maintains packet history buffer (max 1000 packets)
-
-**UI Rendering**:
-- Responsive layout that adapts to terminal size
-- Color-coded display for visual clarity
-- Status bar with real-time statistics
-
-## TODO / Future Improvements
-- [ ] Packet filtering by endpoint, direction, type
-- [ ] Add unit tests
-- [ ] More complex search/find functionality  
-- [ ] Statistics and metrics display
-- [ ] Configuration file support
-- [ ] Horizontal scrolling for long packet details
+- **main.rs**: Entry point — terminal setup/teardown, async event loop, `--load` CLI flag
+- **app.rs**: State machine (`WaitingForDevice` → `SpeedSelection` → `Connecting` → `Capturing`), all input handling, async update dispatch
+- **ui.rs**: Ratatui rendering for every state; help popup; device tree; plugin tab strip
+- **backend.rs**: `CynthionManager` — device detection via nusb, interface claiming, USB packet framing, transaction assembly (`TransactionBuilder`), PCAP read/write, VBUS control
+- **models.rs**: `TransactionInfo`, `TreeItem`, `PacketItem`, `FlatRow`, USB descriptor types, efficient O(n) flat-row helpers
+- **pcap.rs**: PCAP global header and record read/write
+- **plugins/mod.rs**: `UsbPlugin` trait and `PluginManager`; plugins receive every decoded transaction via `on_transaction` and render into the Plugins tab
+- **plugins/cdc.rs**: CDC Serial Monitor plugin
+- **plugins/hid\_mouse.rs**: HID Mouse plugin
+- **plugins/hid\_keyboard.rs**: HID Keyboard plugin
+- **plugins/audio.rs**: USB Audio Class (UAC 1.0) plugin — descriptor parsing, isochronous PCM capture, waveform rendering, playback, WAV export
 
 ## Development Notes
 

@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 use crate::app::{App, AppState, ActiveView};
@@ -28,6 +28,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         AppState::Capturing        => draw_capture(f, main, status, app),
         AppState::Error            => draw_error(f, main, status, app),
         AppState::LoadFile         => draw_load_file(f, main, status, app),
+    }
+
+    if app.show_help {
+        draw_help_popup(f, app);
     }
 }
 
@@ -90,7 +94,7 @@ fn draw_speed_selection(f: &mut Frame, main: Rect, status: Rect, app: &App) {
         .collect();
 
     f.render_widget(List::new(items).block(block), main);
-    render_status(f, status, "↑↓ = select   Enter = confirm", "");
+    render_status(f, status, "↑↓ = select   Enter = connect   o = open pcap", "");
 }
 
 // ---------------------------------------------------------------------------
@@ -423,34 +427,42 @@ fn draw_plugins_view(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(List::new(list_items).block(list_block), list_area);
 
     // ── Content pane ─────────────────────────────────────────────────────────
-    let selected_plugin = &plugins[app.plugin_selected.min(plugins.len() - 1)];
+    let idx = app.plugin_selected.min(plugins.len() - 1);
+
+    // Draw the outer border block and compute the inner area.
     let content_block = Block::default()
-        .title(format!(" {} ", selected_plugin.name()))
+        .title(format!(" {} ", plugins[idx].name()))
         .borders(Borders::ALL);
     let inner = content_block.inner(content_area);
     f.render_widget(content_block, content_area);
 
-    let all_lines: Vec<Line> = selected_plugin
-        .render_lines()
-        .into_iter()
-        .map(|l| l.into_ratatui_line())
-        .collect();
-
-    let max_scroll = all_lines.len().saturating_sub(inner.height as usize);
-    app.plugin_scroll = app.plugin_scroll.min(max_scroll);
     // Keep page_size in sync with visible height for Ctrl+d/u.
     app.page_size = inner.height as usize;
 
-    let visible: Vec<Line> = all_lines
-        .into_iter()
-        .skip(app.plugin_scroll)
-        .take(inner.height as usize)
-        .collect();
+    // Ask the plugin to render itself.  If it returns false, fall back to the
+    // standard scrollable-paragraph renderer.
+    let scroll = app.plugin_scroll;
+    if !plugins[idx].render_custom(f, inner, scroll) {
+        let all_lines: Vec<Line> = plugins[idx]
+            .render_lines()
+            .into_iter()
+            .map(|l| l.into_ratatui_line())
+            .collect();
 
-    f.render_widget(
-        Paragraph::new(visible).wrap(Wrap { trim: false }),
-        inner,
-    );
+        let max_scroll = all_lines.len().saturating_sub(inner.height as usize);
+        app.plugin_scroll = scroll.min(max_scroll);
+
+        let visible: Vec<Line> = all_lines
+            .into_iter()
+            .skip(app.plugin_scroll)
+            .take(inner.height as usize)
+            .collect();
+
+        f.render_widget(
+            Paragraph::new(visible).wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -745,4 +757,180 @@ fn render_status(f: &mut Frame, area: Rect, left: &str, right: &str) {
 
 // Silence unused import warning – TransactionKind is used via App::kind_color.
 const _: fn() = || { let _ = TransactionKind::Other; };
+
+// ---------------------------------------------------------------------------
+// Help popup
+// ---------------------------------------------------------------------------
+
+fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let x = r.x + r.width.saturating_sub(width) / 2;
+    let y = r.y + r.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width.min(r.width), height.min(r.height))
+}
+
+fn draw_help_popup(f: &mut Frame, app: &App) {
+    let lines = help_lines(app);
+
+    const KEY_W: usize = 16;
+    const DESC_W: usize = 40;
+    const POPUP_W: u16  = (KEY_W + DESC_W + 4) as u16;  // +4 for borders + padding
+
+    let popup_h = (lines.len() as u16 + 2).min(f.area().height.saturating_sub(2));
+    let area = centered_rect(POPUP_W, popup_h, f.area());
+
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Help  (? or Esc to close) ")
+        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Scroll if content taller than inner area.
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .take(inner.height as usize)
+        .collect();
+
+    f.render_widget(Paragraph::new(visible), inner);
+}
+
+/// Build the context-sensitive list of help lines.
+fn help_lines(app: &App) -> Vec<Line<'static>> {
+    use crate::app::AppState;
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    macro_rules! header {
+        ($t:expr) => {
+            out.push(Line::from(Span::styled(
+                $t,
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )));
+        };
+    }
+    macro_rules! entry {
+        ($k:expr, $d:expr) => {
+            out.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:<width$}", $k, width = 14),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled($d, Style::default().fg(Color::White)),
+            ]));
+        };
+    }
+    macro_rules! blank { () => { out.push(Line::from("")); }; }
+
+    // ── Global ───────────────────────────────────────────────────────────────
+    header!(" Global");
+    entry!("?",          "Toggle this help");
+    entry!("q / Esc",    "Quit");
+    entry!("Ctrl+C",     "Force quit");
+    entry!("Tab",        "Cycle views (Traffic / Devices / Plugins)");
+    entry!("o",          "Open a saved .pcap file");
+
+    match app.state {
+        AppState::WaitingForDevice | AppState::Connecting => {
+            // Nothing extra; global keys are enough.
+        }
+
+        AppState::SpeedSelection => {
+            blank!();
+            header!(" Speed Selection");
+            entry!("↑ / ↓",     "Move selection");
+            entry!("Enter",      "Confirm speed and connect");
+            entry!("o",          "Open a pcap file (no capture)");
+        }
+
+        AppState::Capturing => {
+            match app.active_view {
+                crate::app::ActiveView::Traffic => {
+                    blank!();
+                    header!(" Traffic View");
+                    entry!("↑ k / ↓ j",  "Move cursor up / down");
+                    entry!("→ l / ← h",  "Expand / collapse transaction");
+                    entry!("Enter",       "Toggle expand / collapse");
+                    entry!("Ctrl+d / u",  "Scroll ½ page down / up");
+                    entry!("PgDn / PgUp", "Scroll full page down / up");
+                    entry!("G",           "Jump to last");
+                    entry!("gg",          "Jump to first");
+                    if app.load_label.is_some() {
+                        entry!("/",       "Open search");
+                        entry!("n / p",   "Next / previous match");
+                    } else {
+                        entry!("s",       "Change capture speed");
+                        entry!("v",       "Toggle VBUS (TARGET-C)");
+                        entry!("Ctrl+S",  "Start / stop saving to .pcap");
+                    }
+                }
+
+                crate::app::ActiveView::Devices => {
+                    blank!();
+                    header!(" Devices View");
+                    entry!("↑ k / ↓ j",  "Move cursor up / down");
+                    entry!("→ l",         "Expand node");
+                    entry!("← h",         "Collapse node / go to parent");
+                    entry!("Enter",        "Toggle expand / collapse");
+                    entry!("Ctrl+d / u",  "Scroll ½ page down / up");
+                    entry!("G",           "Jump to last");
+                    entry!("gg",          "Jump to first");
+                }
+
+                crate::app::ActiveView::Plugins => {
+                    blank!();
+                    header!(" Plugins View");
+                    entry!("↑ k / ↓ j",  "Select previous / next plugin");
+                    entry!("Ctrl+d / u",  "Scroll content ½ page");
+                    entry!("PgDn / PgUp", "Scroll content full page");
+                    entry!("G",           "Scroll to bottom");
+                    entry!("gg",          "Scroll to top");
+
+                    // Plugin-specific keys
+                    let plugins = app.plugin_manager.plugins();
+                    if !plugins.is_empty() {
+                        let idx = app.plugin_selected.min(plugins.len() - 1);
+                        let plugin_help = plugins[idx].help_keys();
+                        if !plugin_help.is_empty() {
+                            blank!();
+                            let name = plugins[idx].name();
+                            out.push(Line::from(Span::styled(
+                                format!(" {name} Plugin"),
+                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            )));
+                            for (k, d) in plugin_help {
+                                out.push(Line::from(vec![
+                                    Span::styled(
+                                        format!("  {:<14}", k),
+                                        Style::default().fg(Color::Cyan),
+                                    ),
+                                    Span::styled(d, Style::default().fg(Color::White)),
+                                ]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        AppState::Error => {
+            blank!();
+            header!(" Error");
+            entry!("Enter", "Return to device selection");
+        }
+
+        AppState::LoadFile => {
+            blank!();
+            header!(" File Browser");
+            entry!("↑ / ↓",  "Navigate files");
+            entry!("Enter / l", "Open selected file");
+            entry!("Esc",    "Cancel");
+        }
+    }
+
+    out
+}
 

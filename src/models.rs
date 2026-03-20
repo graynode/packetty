@@ -129,6 +129,7 @@ pub enum TransactionKind {
     BulkIn,
     BulkOut,
     Interrupt,
+    Isochronous,
     SofGroup,
     Nak,
     Stall,

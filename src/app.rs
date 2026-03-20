@@ -101,6 +101,9 @@ pub struct App {
     /// State to restore if the file dialog is cancelled.
     pub file_dialog_return: AppState,
 
+    /// `true` while the help popup is open.
+    pub show_help: bool,
+
     // Search
     /// `true` while the user is typing a `/` search query.
     pub search_mode: bool,
@@ -122,6 +125,7 @@ impl App {
         plugin_manager.register(Box::new(crate::plugins::cdc::CdcPlugin::new()));
         plugin_manager.register(Box::new(crate::plugins::hid_mouse::HidMousePlugin::new()));
         plugin_manager.register(Box::new(crate::plugins::hid_keyboard::HidKeyboardPlugin::new()));
+        plugin_manager.register(Box::new(crate::plugins::audio::AudioPlugin::new()));
 
         Ok(App {
             state: AppState::WaitingForDevice,
@@ -151,6 +155,7 @@ impl App {
             file_explorer: None,
             pending_load: None,
             file_dialog_return: AppState::WaitingForDevice,
+            show_help: false,
             search_mode: false,
             search_input: String::new(),
             search_query: String::new(),
@@ -199,6 +204,16 @@ impl App {
     pub fn handle_input(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
+        }
+        // `?` toggles the help popup (not while typing a search query).
+        if key.code == KeyCode::Char('?') && key.modifiers.is_empty() && !self.search_mode {
+            self.show_help = !self.show_help;
+            return false;
+        }
+        // When the help popup is open, consume all keys except Esc/?  (already handled above).
+        if self.show_help {
+            if key.code == KeyCode::Esc { self.show_help = false; }
+            return false;
         }
         // Allow Esc to cancel the file dialog without quitting.
         if key.code == KeyCode::Esc {
@@ -278,6 +293,10 @@ impl App {
                 self.state = AppState::Connecting;
                 self.status_message = format!("Connecting at {}…", self.selected_speed);
             }
+            // `o` opens a pcap file without starting a live capture.
+            KeyCode::Char('o') if key.modifiers.is_empty() => {
+                self.open_file_dialog(AppState::SpeedSelection);
+            }
             _ => {}
         }
     }
@@ -326,6 +345,21 @@ impl App {
             }
             KeyCode::Char('s') if key.modifiers.is_empty() => {
                 self.state = AppState::SpeedSelection;
+            }
+            // `v` toggles VBUS (TARGET-C) — only meaningful during live capture.
+            KeyCode::Char('v') if key.modifiers.is_empty() && self.load_label.is_none() => {
+                match self.device_manager.toggle_vbus() {
+                    Ok(on) => {
+                        self.status_message = if on {
+                            "VBUS ON  (TARGET-C)".to_string()
+                        } else {
+                            "VBUS OFF (TARGET-C)".to_string()
+                        };
+                    }
+                    Err(e) => {
+                        self.status_message = format!("VBUS toggle failed: {e}");
+                    }
+                }
             }
             _ => match self.active_view {
                 ActiveView::Traffic => self.handle_traffic_nav(key),
@@ -595,11 +629,19 @@ impl App {
                 let step = (self.page_size / 2).max(1);
                 self.device_selected = self.device_selected.saturating_sub(step);
             }
-            // l / Enter / Right — expand
-            KeyCode::Char('l') | KeyCode::Enter | KeyCode::Right => {
+            // l / Right — expand; Enter — toggle expand/collapse
+            KeyCode::Char('l') | KeyCode::Right => {
                 if let Some(row) = rows.get(self.device_selected) {
                     if let Some(key) = &row.expand_key {
                         self.device_expanded.insert(key.clone(), true);
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(row) = rows.get(self.device_selected) {
+                    if let Some(key) = &row.expand_key {
+                        let currently = *self.device_expanded.get(key).unwrap_or(&false);
+                        self.device_expanded.insert(key.clone(), !currently);
                     }
                 }
             }
@@ -678,6 +720,10 @@ impl App {
             KeyCode::Char('G') => {
                 // Scroll to bottom — clamp happens in the UI renderer
                 self.plugin_scroll = usize::MAX / 2;
+            }
+            // Forward Space, [, ], w to the active plugin (e.g. audio playback/stream select)
+            KeyCode::Char(c @ (' ' | '[' | ']' | 'w')) if key.modifiers.is_empty() => {
+                self.plugin_manager.dispatch_key(self.plugin_selected, c);
             }
             _ => { self.g_pending = false; }
         }
@@ -836,14 +882,15 @@ impl App {
     pub fn kind_color(kind: TransactionKind) -> ratatui::style::Color {
         use ratatui::style::Color;
         match kind {
-            TransactionKind::Control   => Color::Cyan,
-            TransactionKind::BulkIn    => Color::Green,
-            TransactionKind::BulkOut   => Color::Blue,
-            TransactionKind::Interrupt => Color::Magenta,
-            TransactionKind::SofGroup  => Color::DarkGray,
-            TransactionKind::Nak       => Color::Red,
-            TransactionKind::Stall     => Color::LightRed,
-            TransactionKind::Other     => Color::White,
+            TransactionKind::Control      => Color::Cyan,
+            TransactionKind::BulkIn       => Color::Green,
+            TransactionKind::BulkOut      => Color::Blue,
+            TransactionKind::Interrupt    => Color::Magenta,
+            TransactionKind::Isochronous  => Color::LightYellow,
+            TransactionKind::SofGroup     => Color::DarkGray,
+            TransactionKind::Nak          => Color::Red,
+            TransactionKind::Stall        => Color::LightRed,
+            TransactionKind::Other        => Color::White,
         }
     }
 }

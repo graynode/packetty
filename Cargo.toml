@@ -23,3 +23,7 @@ itertools = "0.14"
 hex = "0.4"
 log = "0.4"
 tui-file-explorer = "0.6.6"
+rodio = { version = "0.19", default-features = false, features = ["symphonia-wav"], optional = true }
+
+[features]
+audio-playback = ["rodio"]
