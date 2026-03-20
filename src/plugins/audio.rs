@@ -15,7 +15,7 @@
 //!   Space  — play / stop captured audio
 //!   [  /  ] — cycle through captured streams
 
-use super::{PluginLine, UsbPlugin};
+use super::{PluginLine, PluginNavRequest, UsbPlugin};
 use crate::models::{PacketType, TransactionInfo, TransactionKind, UsbDeviceInfo};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -297,6 +297,17 @@ enum AudioEvent {
     StreamStarted  { label: String },
 }
 
+// ── Media control events ──────────────────────────────────────────────────────
+
+/// A single observable media-control event detected on the bus.
+#[derive(Debug, Clone)]
+struct MediaEvent {
+    /// Timestamp of the originating transaction (nanoseconds from capture start).
+    timestamp_ns: u64,
+    /// Human-readable one-line description.
+    label: String,
+}
+
 // ── Main plugin struct ────────────────────────────────────────────────────────
 
 pub struct AudioPlugin {
@@ -320,6 +331,19 @@ pub struct AudioPlugin {
     /// Current playback position in frames (updated by background thread).
     #[cfg(feature = "audio-playback")]
     playback_pos:    Option<Arc<AtomicUsize>>,
+
+    // Media events list
+    media_events:    Vec<MediaEvent>,
+    /// First transaction timestamp seen; used to compute relative times.
+    first_ts_ns:     Option<u64>,
+    /// `true` when the events list is shown instead of topology in the top pane.
+    events_view:     bool,
+    /// Selected row in the events list.
+    events_selected: usize,
+    /// Scroll offset for the events list.
+    events_scroll:   usize,
+    /// Pending navigation request to hand back to the app.
+    pending_nav:     Option<PluginNavRequest>,
 }
 
 impl AudioPlugin {
@@ -337,6 +361,12 @@ impl AudioPlugin {
             stop_flag:       None,
             #[cfg(feature = "audio-playback")]
             playback_pos:    None,
+            media_events:    Vec::new(),
+            first_ts_ns:     None,
+            events_view:     false,
+            events_selected: 0,
+            events_scroll:   0,
+            pending_nav:     None,
         }
     }
 
@@ -409,10 +439,70 @@ impl AudioPlugin {
             _ => return,
         };
 
-        // Only GET_DESCRIPTOR(CONFIGURATION) responses are useful here.
-        let bm       = setup[0];
-        let req      = setup[1];
-        let desc_typ = (u16::from_le_bytes([setup[2], setup[3]]) >> 8) as u8;
+        let bm     = setup[0];
+        let req    = setup[1];
+        let wvalue = u16::from_le_bytes([setup[2], setup[3]]);
+        let windex = u16::from_le_bytes([setup[4], setup[5]]);
+
+        // ── Standard SET_INTERFACE (stream start / stop) ──────────────────
+        // bmRequestType=0x01: host→device, standard, interface
+        if bm == 0x01 && req == 0x0B {
+            let alt   = (wvalue & 0xFF) as u8;
+            let iface = (windex & 0xFF) as u8;
+            let is_audio_iface = self.devices.values()
+                .flat_map(|d| d.streams.iter())
+                .any(|s| s.interface_num == iface);
+            if is_audio_iface {
+                let label = if alt == 0 {
+                    format!("Stream Stop  — IF{iface}")
+                } else {
+                    let fmt = self.devices.values()
+                        .flat_map(|d| d.streams.iter())
+                        .find(|s| s.interface_num == iface)
+                        .map(|s| s.format_desc())
+                        .unwrap_or_default();
+                    format!("Stream Start — IF{iface}  alt={alt}  {fmt}")
+                };
+                self.media_events.push(MediaEvent { timestamp_ns: txn.timestamp_ns, label });
+            }
+            return;
+        }
+
+        // ── UAC class control: SET_CUR (volume / mute) ────────────────────
+        // bmRequestType=0x21: host→device, class, interface
+        if bm == 0x21 && req == 0x01 {
+            let cs      = (wvalue >> 8) as u8;   // control selector
+            let channel = (wvalue & 0xFF) as u8;
+            let unit_id = (windex >> 8) as u8;
+            let payload = data_pkts.get(1).copied().unwrap_or(&[]);
+            let ch_name = if channel == 0 { "Master".to_string() }
+                          else { format!("Ch{channel}") };
+            match cs {
+                0x01 => { // Mute Control
+                    let muted = payload.first().copied().unwrap_or(0) != 0;
+                    self.media_events.push(MediaEvent {
+                        timestamp_ns: txn.timestamp_ns,
+                        label: format!("{}  — {}  (FU{unit_id})",
+                            if muted { "Mute ON " } else { "Mute OFF" }, ch_name),
+                    });
+                }
+                0x02 => { // Volume Control
+                    if payload.len() >= 2 {
+                        let vol = i16::from_le_bytes([payload[0], payload[1]]);
+                        let db  = vol as f32 / 256.0;
+                        self.media_events.push(MediaEvent {
+                            timestamp_ns: txn.timestamp_ns,
+                            label: format!("Volume {db:+.1} dB  — {}  (FU{unit_id})", ch_name),
+                        });
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // ── GET_DESCRIPTOR(CONFIGURATION) ────────────────────────────────
+        let desc_typ = (wvalue >> 8) as u8;
         if bm != 0x80 || req != 0x06 || desc_typ != 0x02 { return; }
 
         let resp: Vec<u8> = data_pkts[1..].iter()
@@ -748,6 +838,98 @@ impl AudioPlugin {
 
         lines
     }
+
+    fn render_events_list(&self, f: &mut Frame<'_>, area: Rect) {
+        if area.height < 3 { return; }
+
+        let hint_h   = 1u16;
+        let list_h   = area.height.saturating_sub(2 + hint_h); // 1 header + 1 separator
+        let header_h = 2u16;
+
+        let [header_area, list_area, hint_area] = Layout::vertical([
+            Constraint::Length(header_h),
+            Constraint::Length(list_h),
+            Constraint::Length(hint_h),
+        ]).areas(area);
+
+        // Header
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "  Media Control Events",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "─".repeat(80),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]),
+            header_area,
+        );
+
+        // Events list
+        let n = self.media_events.len();
+        if n == 0 {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  No media control events captured yet.",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                list_area,
+            );
+        } else {
+            // Auto-clamp scroll so selected row stays visible
+            let visible_rows = list_h as usize;
+            let scroll = {
+                let mut s = self.events_scroll;
+                if self.events_selected < s {
+                    s = self.events_selected;
+                }
+                if self.events_selected >= s + visible_rows {
+                    s = self.events_selected + 1 - visible_rows;
+                }
+                s
+            };
+
+            let first_ts = self.first_ts_ns.unwrap_or(0);
+            let lines: Vec<Line> = self.media_events.iter()
+                .enumerate()
+                .skip(scroll)
+                .take(visible_rows)
+                .map(|(i, ev)| {
+                    let rel_secs = (ev.timestamp_ns.saturating_sub(first_ts)) as f64 / 1_000_000_000.0;
+                    let ts_str   = format!("+{:.3}s", rel_secs);
+                    let text     = format!("  {:>9}  {}", ts_str, ev.label);
+                    if i == self.events_selected {
+                        Line::from(Span::styled(
+                            text,
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                    } else {
+                        Line::from(Span::styled(text, Style::default().fg(Color::White)))
+                    }
+                })
+                .collect();
+
+            f.render_widget(Paragraph::new(lines), list_area);
+        }
+
+        // Hint line
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" e", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled("=topology  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("j/k", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled("=navigate  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled("=goto transaction", Style::default().fg(Color::DarkGray)),
+            ])),
+            hint_area,
+        );
+    }
 }
 
 // ── UsbPlugin impl ────────────────────────────────────────────────────────────
@@ -757,6 +939,9 @@ impl UsbPlugin for AudioPlugin {
     fn description(&self) -> &str { "Decodes UAC topology, stream format, and PCM audio data" }
 
     fn on_transaction(&mut self, txn: &TransactionInfo, devices: &[UsbDeviceInfo]) {
+        if self.first_ts_ns.is_none() {
+            self.first_ts_ns = Some(txn.timestamp_ns);
+        }
         self.refresh_from_devices(devices);
         match txn.kind {
             TransactionKind::Control => self.handle_control(txn),
@@ -775,6 +960,12 @@ impl UsbPlugin for AudioPlugin {
         self.announced.clear();
         self.audio_eps.clear();
         self.selected_idx = 0;
+        self.media_events.clear();
+        self.first_ts_ns     = None;
+        self.events_view     = false;
+        self.events_selected = 0;
+        self.events_scroll   = 0;
+        self.pending_nav     = None;
         #[cfg(feature = "audio-playback")]
         { self.playback_thread = None; self.stop_flag = None; self.playback_pos = None; }
     }
@@ -804,9 +995,9 @@ impl UsbPlugin for AudioPlugin {
 
     // ── Custom render: topology top + waveform bottom ──────────────────────
     fn render_custom(&self, f: &mut Frame<'_>, area: Rect, scroll: usize) -> bool {
-        let keys     = self.sorted_keys();
+        let keys      = self.sorted_keys();
         let n_streams = keys.len();
-        let sel      = if n_streams > 0 { self.selected_idx.min(n_streams - 1) } else { 0 };
+        let sel       = if n_streams > 0 { self.selected_idx.min(n_streams - 1) } else { 0 };
 
         // Decide how to split the area.
         let wave_h: u16 = if n_streams > 0 && area.height >= 14 {
@@ -814,22 +1005,25 @@ impl UsbPlugin for AudioPlugin {
         } else {
             0
         };
-        let topo_h = area.height.saturating_sub(wave_h);
+        let top_h = area.height.saturating_sub(wave_h);
 
         let areas = if wave_h > 0 {
             Layout::vertical([
-                Constraint::Length(topo_h),
+                Constraint::Length(top_h),
                 Constraint::Length(wave_h),
             ]).split(area)
         } else {
             Layout::vertical([Constraint::Min(0)]).split(area)
         };
 
-        let topo_area = areas[0];
+        let top_area  = areas[0];
         let wave_area = if wave_h > 0 { areas[1] } else { Rect::default() };
 
-        // ── Topology / header section ──────────────────────────────────────
-        {
+        if self.events_view {
+            // ── Media Events list ──────────────────────────────────────────
+            self.render_events_list(f, top_area);
+        } else {
+            // ── Topology / header section ──────────────────────────────────
             let mut header = Vec::new();
             header.push(Line::from(Span::styled(
                 "  USB Audio Class Monitor",
@@ -850,11 +1044,11 @@ impl UsbPlugin for AudioPlugin {
                 .collect();
 
             let all_lines: Vec<Line> = header.into_iter().chain(topo_text).collect();
-            let max_scroll = all_lines.len().saturating_sub(topo_h as usize);
+            let max_scroll = all_lines.len().saturating_sub(top_h as usize);
             let skip       = scroll.min(max_scroll);
 
-            let visible: Vec<Line> = all_lines.into_iter().skip(skip).take(topo_h as usize).collect();
-            f.render_widget(Paragraph::new(visible), topo_area);
+            let visible: Vec<Line> = all_lines.into_iter().skip(skip).take(top_h as usize).collect();
+            f.render_widget(Paragraph::new(visible), top_area);
         }
 
         // ── Waveform section ───────────────────────────────────────────────
@@ -869,12 +1063,29 @@ impl UsbPlugin for AudioPlugin {
     }
 
     fn help_keys(&self) -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("Space",        "Play / stop captured audio"),
-            ("[",            "Select previous stream"),
-            ("]",            "Select next stream"),
-            ("w",            "Save stream to .wav file"),
-        ]
+        if self.events_view {
+            vec![
+                ("e",            "Back to topology view"),
+                ("j / k",        "Select next / previous event"),
+                ("Enter",        "Jump to event in Traffic view"),
+            ]
+        } else {
+            vec![
+                ("Space",        "Play / stop captured audio"),
+                ("[",            "Select previous stream"),
+                ("]",            "Select next stream"),
+                ("w",            "Save stream to .wav file"),
+                ("e",            "Show media control events"),
+            ]
+        }
+    }
+
+    fn captures_navigation(&self) -> bool {
+        self.events_view
+    }
+
+    fn take_nav_request(&mut self) -> Option<PluginNavRequest> {
+        self.pending_nav.take()
     }
 
     fn on_key(&mut self, key: char) {
@@ -931,6 +1142,28 @@ impl UsbPlugin for AudioPlugin {
                             Err(e) => crate::dbg_log!("write_wav: error: {e}"),
                         }
                     }
+                }
+            }
+            'e' => {
+                self.events_view = !self.events_view;
+                self.events_selected = self.events_selected.min(
+                    self.media_events.len().saturating_sub(1)
+                );
+            }
+            // Events list navigation (only meaningful when events_view is active,
+            // but harmless otherwise since app only routes j/k/Enter here when
+            // captures_navigation() returns true).
+            'j' => {
+                let n = self.media_events.len();
+                if n > 0 { self.events_selected = (self.events_selected + 1).min(n - 1); }
+            }
+            'k' => {
+                if self.events_selected > 0 { self.events_selected -= 1; }
+            }
+            '\r' => {
+                // Enter: request navigation to the selected event's transaction.
+                if let Some(ev) = self.media_events.get(self.events_selected) {
+                    self.pending_nav = Some(PluginNavRequest::GotoTimestamp(ev.timestamp_ns));
                 }
             }
             _ => {}

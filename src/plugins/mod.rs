@@ -54,6 +54,21 @@ impl PluginLine {
 // UsbPlugin trait
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// PluginNavRequest — plugin-initiated navigation back to the main view
+// ---------------------------------------------------------------------------
+
+/// A navigation action a plugin can request after handling a key press.
+#[derive(Debug, Clone)]
+pub enum PluginNavRequest {
+    /// Jump to the transaction in the Traffic view whose timestamp matches.
+    GotoTimestamp(u64),
+}
+
+// ---------------------------------------------------------------------------
+// UsbPlugin trait
+// ---------------------------------------------------------------------------
+
 /// Trait implemented by every USB higher-level decoder plugin.
 ///
 /// Each plugin receives every completed transaction and the current device
@@ -99,6 +114,14 @@ pub trait UsbPlugin: Send {
     /// Returns plugin-specific key bindings shown in the help popup.
     /// Each entry is `(key_label, description)`.
     fn help_keys(&self) -> Vec<(&'static str, &'static str)> { vec![] }
+
+    /// When `true`, the plugin wants to receive `j`/`k`/Enter navigation keys
+    /// directly (e.g. while an internal list is focused) instead of having
+    /// them used for plugin selection.
+    fn captures_navigation(&self) -> bool { false }
+
+    /// Consume and return a pending navigation request produced by `on_key`.
+    fn take_nav_request(&mut self) -> Option<PluginNavRequest> { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -152,5 +175,15 @@ impl PluginManager {
         if let Some(p) = self.plugins.get_mut(idx) {
             p.on_key(key);
         }
+    }
+
+    /// Returns `true` if the selected plugin wants to handle navigation keys.
+    pub fn plugin_captures_nav(&self, idx: usize) -> bool {
+        self.plugins.get(idx).map(|p| p.captures_navigation()).unwrap_or(false)
+    }
+
+    /// Consume a pending navigation request from the selected plugin.
+    pub fn take_nav_request(&mut self, idx: usize) -> Option<PluginNavRequest> {
+        self.plugins.get_mut(idx)?.take_nav_request()
     }
 }

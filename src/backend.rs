@@ -123,6 +123,10 @@ impl CynthionManager {
         })
     }
 
+    pub fn has_found_device(&self) -> bool {
+        self.found_device.is_some()
+    }
+
     pub async fn find_device(&mut self) -> Result<Option<DeviceInfo>> {
         dbg_log!("find_device: calling nusb::list_devices()");
         let devices = nusb::list_devices().await?;

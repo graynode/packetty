@@ -161,12 +161,19 @@ fn draw_capture(f: &mut Frame, main: Rect, status: Rect, app: &mut App) {
     } else {
         app.status_message.clone()
     };
+    let (cur_pos, total_rows) = app.selected_flat_position();
+    let pos_str = if cur_pos > 0 {
+        format!("{cur_pos}/{total_rows}")
+    } else {
+        format!("-/{total_rows}")
+    };
     let hint = format!(
-        "Tab=views  {}  o=open  j/k=↑↓  Ctrl+d/u=½pg  G/gg=last/first  {}  q=quit  txns={}  pkts={}",
-        if app.load_label.is_some() { "/=search  n/p=next/prev" } else { "s=speed  Ctrl+S=save" },
+        "Tab=views  {}  o=open  j/k=↑↓  Ctrl+d/u=½pg  G/gg=last/first  {}  q=quit  txns={}  pkts={}  [{}]",
+        if app.load_label.is_some() { "/=search  n/p=next/prev  s=capture" } else { "s=speed  Ctrl+S=save" },
         if app.load_label.is_none() { "h/l=←→" } else { "" },
         app.transaction_count(),
         app.packet_count(),
+        pos_str,
     );
     render_status(f, status, &state_str, &hint);
 }
@@ -861,6 +868,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                     if app.load_label.is_some() {
                         entry!("/",       "Open search");
                         entry!("n / p",   "Next / previous match");
+                        entry!("s",       "Start a new live capture");
                     } else {
                         entry!("s",       "Change capture speed");
                         entry!("v",       "Toggle VBUS (TARGET-C)");

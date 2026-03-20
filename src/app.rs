@@ -3,7 +3,7 @@ use crate::dbg_log;
 use crate::models::{FlatRow, TreeItem, TransactionKind, UsbDeviceInfo,
                     flat_row_count, flat_index_resolve, flat_top_row_index,
                     flat_rows_window, hex_ascii_dump, bytes_to_text_hints};
-use crate::plugins::PluginManager;
+use crate::plugins::{PluginManager, PluginNavRequest};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, VecDeque};
@@ -679,6 +679,32 @@ impl App {
         let n_plugins = self.plugin_manager.len();
         if n_plugins == 0 { return; }
 
+        // When the active plugin has an internal list focused it wants j/k/Enter
+        // for itself rather than for plugin selection.
+        let captures = self.plugin_manager.plugin_captures_nav(self.plugin_selected);
+
+        let dispatched = match key.code {
+            KeyCode::Char('j') | KeyCode::Down if captures && key.modifiers.is_empty() => {
+                self.plugin_manager.dispatch_key(self.plugin_selected, 'j'); true
+            }
+            KeyCode::Char('k') | KeyCode::Up if captures && key.modifiers.is_empty() => {
+                self.plugin_manager.dispatch_key(self.plugin_selected, 'k'); true
+            }
+            KeyCode::Enter if captures => {
+                self.plugin_manager.dispatch_key(self.plugin_selected, '\r'); true
+            }
+            _ => false,
+        };
+
+        // After any plugin key dispatch, check for a pending nav request.
+        if dispatched {
+            if let Some(nav) = self.plugin_manager.take_nav_request(self.plugin_selected) {
+                self.handle_plugin_nav_request(nav);
+            }
+            self.g_pending = false;
+            return;
+        }
+
         match key.code {
             // Select previous / next plugin in the list
             KeyCode::Char('k') | KeyCode::Up => {
@@ -718,16 +744,45 @@ impl App {
                 }
             }
             KeyCode::Char('G') => {
-                // Scroll to bottom — clamp happens in the UI renderer
                 self.plugin_scroll = usize::MAX / 2;
             }
-            // Forward Space, [, ], w to the active plugin (e.g. audio playback/stream select)
-            KeyCode::Char(c @ (' ' | '[' | ']' | 'w')) if key.modifiers.is_empty() => {
+            // Forward Space, [, ], w, e to the active plugin.
+            KeyCode::Char(c @ (' ' | '[' | ']' | 'w' | 'e')) if key.modifiers.is_empty() => {
                 self.plugin_manager.dispatch_key(self.plugin_selected, c);
+                if let Some(nav) = self.plugin_manager.take_nav_request(self.plugin_selected) {
+                    self.handle_plugin_nav_request(nav);
+                }
             }
             _ => { self.g_pending = false; }
         }
         self.g_pending = false;
+    }
+
+    fn handle_plugin_nav_request(&mut self, nav: PluginNavRequest) {
+        match nav {
+            PluginNavRequest::GotoTimestamp(ts) => {
+                // Find the first tree item at or after the target timestamp.
+                for (ti, item) in self.tree_items.iter().enumerate() {
+                    if item.timestamp_ns >= ts {
+                        if let Some(flat) = flat_top_row_index(&self.tree_items, ti) {
+                            self.selected_row = Some(flat);
+                            let len = flat_row_count(&self.tree_items);
+                            self.clamp_scroll(len);
+                            self.active_view = ActiveView::Traffic;
+                        }
+                        return;
+                    }
+                }
+                // Timestamp past end — jump to last row.
+                if !self.tree_items.is_empty() {
+                    let last = flat_row_count(&self.tree_items) - 1;
+                    self.selected_row = Some(last);
+                    let len = last + 1;
+                    self.clamp_scroll(len);
+                    self.active_view = ActiveView::Traffic;
+                }
+            }
+        }
     }
 
     fn clamp_scroll(&mut self, flat_len: usize) {
@@ -779,10 +834,29 @@ impl App {
                     }
                     return Ok(());
                 }
+                // If we came from pcap viewing (s key) the device scan may not
+                // have run yet — find it now before trying to open it.
+                if !self.device_manager.has_found_device() {
+                    dbg_log!("update: Connecting — no device cached, scanning first");
+                    match self.device_manager.find_device().await? {
+                        None => {
+                            self.state = AppState::Error;
+                            self.error_message = Some("No Cynthion device found".to_string());
+                            return Ok(());
+                        }
+                        Some(info) => {
+                            self.selected_device = Some(info);
+                        }
+                    }
+                }
                 dbg_log!("update: Connecting → calling open_device()");
                 match self.device_manager.open_device(self.selected_speed).await {
                     Ok(()) => {
                         dbg_log!("update: open_device() OK → Capturing");
+                        // Discard any previously loaded pcap and start fresh.
+                        self.clear_capture_state();
+                        self.load_label = None;
+                        self.save_label = None;
                         self.usb_devices = self.device_manager.discovered_devices();
                         self.state = AppState::Capturing;
                         self.status_message = format!(
@@ -799,7 +873,8 @@ impl App {
             }
             AppState::Capturing => {
                 if let Some(txns) = self.device_manager.get_new_transactions().await? {
-                    let auto_scroll = self.selected_row.is_none();
+                    // Auto-scroll only during live capture; loaded files start at the top.
+                    let auto_scroll = self.selected_row.is_none() && self.load_label.is_none();
                     // Refresh device list once per batch.
                     self.usb_devices = self.device_manager.discovered_devices();
                     for txn in txns {
@@ -864,6 +939,14 @@ impl App {
                 .collect();
             if all.is_empty() { None } else { Some(all) }
         }
+    }
+
+    /// Current flat-row position (1-based) and total flat rows.
+    /// Returns `(0, total)` when nothing is selected.
+    pub fn selected_flat_position(&self) -> (usize, usize) {
+        let total = flat_row_count(&self.tree_items);
+        let pos   = self.selected_row.map(|r| r + 1).unwrap_or(0);
+        (pos, total)
     }
 
     /// Total number of top-level transaction nodes captured.
