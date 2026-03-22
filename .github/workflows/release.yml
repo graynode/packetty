@@ -38,10 +38,36 @@ jobs:
           name: packetty-linux-x86_64
           path: packetty-linux-x86_64.tar.gz
 
+  # ── macOS arm64 (Apple Silicon / M-series) ──────────────────────────────────
+  build-macos-arm64:
+    name: macOS arm64 (Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build
+        run: cargo build --release --all-features --target aarch64-apple-darwin
+
+      - name: Package
+        run: |
+          cp target/aarch64-apple-darwin/release/packetty packetty
+          tar czf packetty-macos-arm64.tar.gz packetty
+          rm packetty
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packetty-macos-arm64
+          path: packetty-macos-arm64.tar.gz
+
   # ── macOS universal (arm64 + x86_64) ────────────────────────────────────────
   build-macos:
     name: macOS universal
-    runs-on: macos-latest
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
 
@@ -103,7 +129,7 @@ jobs:
   # ── GitHub Release ───────────────────────────────────────────────────────────
   release:
     name: Publish release
-    needs: [build-linux, build-macos, build-windows]
+    needs: [build-linux, build-macos-arm64, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -115,6 +141,7 @@ jobs:
         with:
           files: |
             packetty-linux-x86_64.tar.gz
+            packetty-macos-arm64.tar.gz
             packetty-macos-universal.tar.gz
             packetty-windows-x86_64.zip
           generate_release_notes: true
