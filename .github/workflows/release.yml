@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Linux x86_64 ────────────────────────────────────────────────────────────
+  build-linux:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libasound2-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build
+        run: cargo build --release --all-features --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          cp target/x86_64-unknown-linux-gnu/release/packetty packetty
+          tar czf packetty-linux-x86_64.tar.gz packetty
+          rm packetty
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packetty-linux-x86_64
+          path: packetty-linux-x86_64.tar.gz
+
+  # ── macOS universal (arm64 + x86_64) ────────────────────────────────────────
+  build-macos:
+    name: macOS universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build arm64
+        run: cargo build --release --all-features --target aarch64-apple-darwin
+
+      - name: Build x86_64
+        run: cargo build --release --all-features --target x86_64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          lipo -create \
+            target/aarch64-apple-darwin/release/packetty \
+            target/x86_64-apple-darwin/release/packetty \
+            -output packetty
+
+      - name: Package
+        run: |
+          tar czf packetty-macos-universal.tar.gz packetty
+          rm packetty
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packetty-macos-universal
+          path: packetty-macos-universal.tar.gz
+
+  # ── Windows x86_64 ──────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --release --all-features --target x86_64-pc-windows-msvc
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item target\x86_64-pc-windows-msvc\release\packetty.exe packetty.exe
+          Compress-Archive -Path packetty.exe -DestinationPath packetty-windows-x86_64.zip
+          Remove-Item packetty.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packetty-windows-x86_64
+          path: packetty-windows-x86_64.zip
+
+  # ── GitHub Release ───────────────────────────────────────────────────────────
+  release:
+    name: Publish release
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            packetty-linux-x86_64.tar.gz
+            packetty-macos-universal.tar.gz
+            packetty-windows-x86_64.zip
+          generate_release_notes: true
