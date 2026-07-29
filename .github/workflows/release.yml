@@ -29,9 +29,10 @@ jobs:
 
       - name: Package
         run: |
-          cp target/x86_64-unknown-linux-gnu/release/packetty packetty
-          tar czf packetty-linux-x86_64.tar.gz packetty
-          rm packetty
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/packetty dist/packetty
+          tar czf packetty-linux-x86_64.tar.gz -c dist packetty
+          rm -rf dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -55,9 +56,10 @@ jobs:
 
       - name: Package
         run: |
-          cp target/aarch64-apple-darwin/release/packetty packetty
-          tar czf packetty-macos-arm64.tar.gz packetty
-          rm packetty
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/packetty dist/packetty
+          tar czf packetty-macos-arm64.tar.gz -c dist packetty
+          rm -rf dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -84,15 +86,16 @@ jobs:
 
       - name: Create universal binary
         run: |
+          mkdir -p dist
           lipo -create \
             target/aarch64-apple-darwin/release/packetty \
             target/x86_64-apple-darwin/release/packetty \
-            -output packetty
+            -output dist/packetty
 
       - name: Package
         run: |
-          tar czf packetty-macos-universal.tar.gz packetty
-          rm packetty
+          tar czf packetty-macos-universal.tar.gz -C dist packetty
+          rm -rf dist
 
       - uses: actions/upload-artifact@v4
         with:
