@@ -12,7 +12,7 @@
 //! For a control transfer the first non-empty DATA packet is the 8-byte SETUP header;
 //! subsequent non-empty DATA packets carry the data-stage payload.
 
-use super::{UsbPlugin, PluginLine};
+use crate::{UsbPlugin, PluginLine};
 use crate::models::{PacketType, TransactionInfo, TransactionKind, UsbDeviceInfo};
 use ratatui::style::Color;
 

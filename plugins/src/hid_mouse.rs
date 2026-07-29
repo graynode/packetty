@@ -8,7 +8,7 @@
 //!
 //! HID control requests (SET_PROTOCOL, SET_IDLE) are also decoded.
 
-use super::{UsbPlugin, PluginLine};
+use crate::{UsbPlugin, PluginLine};
 use crate::models::{PacketType, TransactionInfo, TransactionKind, UsbDeviceInfo};
 use ratatui::style::Color;
 

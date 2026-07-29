@@ -12,7 +12,7 @@
 //!   - SET_REPORT output reports: keyboard LED state (NumLk, CapsLk, ScrLk)
 //!   - SET_PROTOCOL, SET_IDLE control requests
 
-use super::{UsbPlugin, PluginLine};
+use crate::{UsbPlugin, PluginLine};
 use crate::models::{PacketType, TransactionInfo, TransactionKind, UsbDeviceInfo};
 use ratatui::style::Color;
 

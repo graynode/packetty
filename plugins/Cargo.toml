@@ -1,0 +1,13 @@
+[package]
+name = "plugins"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui    = "0.30"
+crossterm  = "0.29"
+anyhow     = "1.0"
+rodio      = { version = "0.19", default-features = false, features = ["symphonia-wav"], optional = true }
+
+[features]
+audio-playback = ["rodio"]

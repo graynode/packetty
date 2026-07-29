@@ -1,13 +1,14 @@
-use crate::backend::{CynthionManager, DeviceInfo};
+use crate::capture::{CaptureSession, Speed};
 use crate::dbg_log;
-use crate::models::{FlatRow, TreeItem, TransactionKind, UsbDeviceInfo,
-                    flat_row_count, flat_index_resolve, flat_top_row_index,
-                    flat_rows_window, hex_ascii_dump, bytes_to_text_hints};
-use crate::plugins::{PluginManager, PluginNavRequest};
+use crate::device::{ActiveDevice, DeviceManager};
+use crate::models::{FlatRow, ItemStore, RowKind, UsbDeviceInfo};
+use crate::plugin_bridge;
+use plugins::{PluginManager, PluginNavRequest};
+
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::{HashMap, VecDeque};
-use tui_file_explorer::{FileExplorer, ExplorerOutcome};
+use std::collections::HashMap;
+use tui_file_explorer::{ExplorerOutcome, FileExplorer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
@@ -28,39 +29,27 @@ pub enum ActiveView {
     Plugins,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Speed {
-    High = 0,
-    Full = 1,
-    Low  = 2,
-    Auto = 3,
-}
-
-impl std::fmt::Display for Speed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Speed::High => write!(f, "High-Speed (480 Mbps)"),
-            Speed::Full => write!(f, "Full-Speed (12 Mbps)"),
-            Speed::Low  => write!(f, "Low-Speed (1.5 Mbps)"),
-            Speed::Auto => write!(f, "Auto"),
-        }
-    }
-}
-
 pub struct App {
     pub state: AppState,
     pub active_view: ActiveView,
-    pub device_manager: CynthionManager,
-    pub selected_device: Option<DeviceInfo>,
+    pub device_manager: DeviceManager,
+    pub selected_device: Option<ActiveDevice>,
     pub selected_speed: Speed,
     pub speed_options: Vec<Speed>,
     pub selected_speed_idx: usize,
     pub status_message: String,
     pub error_message: Option<String>,
 
-    // Traffic view
-    /// Top-level transaction nodes in capture order.
-    pub tree_items: VecDeque<TreeItem>,
+    // Traffic view / capture session
+    pub capture: Option<CaptureSession>,
+    pub items: Option<ItemStore>,
+    last_synced_top: u64,
+    /// How many packets of `last_synced_top`'s item have already been fed to
+    /// plugins, when that item was too large to finish in one `sync()` call.
+    plugin_sync_offset: u64,
+    /// Set by the `v` key; consumed (and the actual async VBUS toggle
+    /// performed) on the next `update()` tick.
+    pending_power_toggle: bool,
     /// Selected row index into the *flattened* view (across expanded children).
     pub selected_row: Option<usize>,
     /// First visible row index (for scrolling).
@@ -84,14 +73,14 @@ pub struct App {
     pub plugin_selected: usize,
     /// Scroll offset into the selected plugin's rendered lines.
     pub plugin_scroll: usize,
+    /// `true` when the content pane has keyboard focus (Enter to enter, Esc to leave).
+    pub plugin_pane_focus: bool,
 
     device_check_counter: usize,
     /// `true` when the user has pressed `g` once; a second `g` goes to top.
     g_pending: bool,
 
     // PCAP save/load
-    /// Display name of the save file (shown in status bar).
-    pub save_label: Option<String>,
     /// Display name of the loaded file (shown in status bar).
     pub load_label: Option<String>,
     /// File-browser widget shown when AppState::LoadFile is active.
@@ -119,13 +108,14 @@ pub struct App {
 
 impl App {
     pub async fn new() -> Result<Self> {
-        let device_manager = CynthionManager::new().await?;
+        let device_manager = DeviceManager::new().await?;
 
         let mut plugin_manager = PluginManager::new();
-        plugin_manager.register(Box::new(crate::plugins::cdc::CdcPlugin::new()));
-        plugin_manager.register(Box::new(crate::plugins::hid_mouse::HidMousePlugin::new()));
-        plugin_manager.register(Box::new(crate::plugins::hid_keyboard::HidKeyboardPlugin::new()));
-        plugin_manager.register(Box::new(crate::plugins::audio::AudioPlugin::new()));
+        plugin_manager.register(Box::new(plugins::cdc::CdcPlugin::new()));
+        plugin_manager.register(Box::new(plugins::hid_mouse::HidMousePlugin::new()));
+        plugin_manager.register(Box::new(plugins::hid_keyboard::HidKeyboardPlugin::new()));
+        plugin_manager.register(Box::new(plugins::audio::AudioPlugin::new()));
+        plugin_manager.register(Box::new(plugins::hci::HciPlugin::new()));
 
         Ok(App {
             state: AppState::WaitingForDevice,
@@ -135,9 +125,13 @@ impl App {
             selected_speed: Speed::High,
             speed_options: vec![Speed::High, Speed::Full, Speed::Low, Speed::Auto],
             selected_speed_idx: 0,
-            status_message: "Waiting for Cynthion device…".to_string(),
+            status_message: "Waiting for a USB analyzer device…".to_string(),
             error_message: None,
-            tree_items: VecDeque::new(),
+            capture: None,
+            items: None,
+            last_synced_top: 0,
+            plugin_sync_offset: 0,
+            pending_power_toggle: false,
             selected_row: None,
             scroll_offset: 0,
             page_size: 30,
@@ -148,9 +142,9 @@ impl App {
             plugin_manager,
             plugin_selected: 0,
             plugin_scroll: 0,
+            plugin_pane_focus: false,
             device_check_counter: 0,
             g_pending: false,
-            save_label: None,
             load_label: None,
             file_explorer: None,
             pending_load: None,
@@ -164,23 +158,27 @@ impl App {
         })
     }
 
-    /// Jump directly to Capturing state by replaying a pcap file.
+    /// Jump directly to Capturing state by replaying a pcap/pcapng file.
     pub async fn start_load(&mut self, path: std::path::PathBuf) -> Result<()> {
-        let label = path.file_name()
+        let label = path
+            .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        self.device_manager.load_pcap_file(path).await?;
+        let session = CaptureSession::start_load(path)?;
+        let reader = session.reader.clone();
+        self.clear_capture_state();
+        self.capture = Some(session);
+        self.items = Some(ItemStore::new(reader));
         self.state = AppState::Capturing;
         self.load_label = Some(label.clone());
-        self.save_label = None;
         self.status_message = format!("Loaded: {label}");
-        self.clear_capture_state();
         Ok(())
     }
 
-    /// Clear all per-capture UI state so a new file can be loaded cleanly.
+    /// Clear all per-capture UI state so a new capture/file can start cleanly.
     fn clear_capture_state(&mut self) {
-        self.tree_items.clear();
+        self.last_synced_top = 0;
+        self.plugin_sync_offset = 0;
         self.usb_devices.clear();
         self.device_expanded.clear();
         self.selected_row = None;
@@ -194,6 +192,45 @@ impl App {
         self.search_match_idx = None;
         self.plugin_manager.reset();
         self.plugin_scroll = 0;
+        self.plugin_pane_focus = false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Flat-row helpers (wrap the fallible ItemStore queries for input handling)
+    // -----------------------------------------------------------------------
+
+    fn flat_len(&mut self) -> usize {
+        match self.items.as_mut() {
+            Some(store) => store.flat_row_count().unwrap_or_else(|e| {
+                dbg_log!("flat_row_count error: {e}");
+                0
+            }) as usize,
+            None => 0,
+        }
+    }
+
+    fn resolve(&mut self, flat_idx: usize) -> Option<(usize, Option<usize>)> {
+        let store = self.items.as_mut()?;
+        match store.flat_index_resolve(flat_idx as u64) {
+            Ok(Some((ti, ci))) => Some((ti as usize, ci.map(|c| c as usize))),
+            Ok(None) => None,
+            Err(e) => {
+                dbg_log!("flat_index_resolve error: {e}");
+                None
+            }
+        }
+    }
+
+    fn top_row_index(&mut self, top_idx: usize) -> Option<usize> {
+        let store = self.items.as_mut()?;
+        match store.flat_top_row_index(top_idx as u64) {
+            Ok(Some(v)) => Some(v as usize),
+            Ok(None) => None,
+            Err(e) => {
+                dbg_log!("flat_top_row_index error: {e}");
+                None
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -205,21 +242,24 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
         }
-        // `?` toggles the help popup (not while typing a search query).
         if key.code == KeyCode::Char('?') && key.modifiers.is_empty() && !self.search_mode {
             self.show_help = !self.show_help;
             return false;
         }
-        // When the help popup is open, consume all keys except Esc/?  (already handled above).
         if self.show_help {
-            if key.code == KeyCode::Esc { self.show_help = false; }
+            if key.code == KeyCode::Esc {
+                self.show_help = false;
+            }
             return false;
         }
-        // Allow Esc to cancel the file dialog without quitting.
         if key.code == KeyCode::Esc {
             if self.state == AppState::LoadFile {
                 self.file_explorer = None;
                 self.state = self.file_dialog_return;
+                return false;
+            }
+            if self.active_view == ActiveView::Plugins && self.plugin_pane_focus {
+                self.plugin_pane_focus = false;
                 return false;
             }
             return true;
@@ -229,7 +269,6 @@ impl App {
         }
         match self.state {
             AppState::WaitingForDevice | AppState::Connecting => {
-                // `o` opens the file-load dialog from the waiting screen.
                 if key.code == KeyCode::Char('o') && key.modifiers.is_empty() {
                     self.open_file_dialog(AppState::WaitingForDevice);
                 }
@@ -251,14 +290,17 @@ impl App {
         let return_state = self.file_dialog_return;
         let explorer = match self.file_explorer.as_mut() {
             Some(e) => e,
-            None => { self.state = return_state; return; }
+            None => {
+                self.state = return_state;
+                return;
+            }
         };
         match explorer.handle_key(key) {
             ExplorerOutcome::Selected(path) => {
                 self.file_explorer = None;
                 self.pending_load = Some(path);
                 self.state = AppState::Connecting;
-                self.status_message = "Loading pcap file…".to_string();
+                self.status_message = "Loading capture file…".to_string();
             }
             ExplorerOutcome::Dismissed => {
                 self.file_explorer = None;
@@ -273,6 +315,7 @@ impl App {
         self.file_explorer = Some(
             FileExplorer::builder(start)
                 .allow_extension("pcap")
+                .allow_extension("pcapng")
                 .build(),
         );
         self.file_dialog_return = return_to;
@@ -291,9 +334,8 @@ impl App {
             }
             KeyCode::Enter => {
                 self.state = AppState::Connecting;
-                self.status_message = format!("Connecting at {}…", self.selected_speed);
+                self.status_message = format!("Connecting at {}…", self.selected_speed.description());
             }
-            // `o` opens a pcap file without starting a live capture.
             KeyCode::Char('o') if key.modifiers.is_empty() => {
                 self.open_file_dialog(AppState::SpeedSelection);
             }
@@ -302,17 +344,13 @@ impl App {
     }
 
     fn handle_capture_input(&mut self, key: KeyEvent) {
-        // While search input is active, funnel all keys there.
         if self.search_mode {
             self.handle_search_input(key);
             return;
         }
 
-        // Ctrl+S: toggle PCAP save (only while live-capturing, not when loading a file).
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            if self.load_label.is_none() {
-                self.toggle_save();
-            }
+            self.save_capture();
             return;
         }
         match key.code {
@@ -323,43 +361,34 @@ impl App {
                     ActiveView::Plugins => ActiveView::Traffic,
                 };
             }
-            // `o` opens the file dialog to load a (new) pcap while capturing.
             KeyCode::Char('o') if key.modifiers.is_empty() => {
                 self.open_file_dialog(AppState::Capturing);
             }
-            // `/` opens search — only available when reviewing a loaded file (not live capture).
             KeyCode::Char('/') if self.load_label.is_some() && key.modifiers.is_empty() => {
                 self.search_mode = true;
                 self.search_input.clear();
             }
-            // `n` → next match, `p` → previous match.
             KeyCode::Char('n') if key.modifiers.is_empty() && !self.search_matches.is_empty() => {
                 let next = self.search_match_idx.map(|i| i + 1).unwrap_or(0);
                 self.jump_to_match(next);
             }
             KeyCode::Char('p') if key.modifiers.is_empty() && !self.search_matches.is_empty() => {
-                let prev = self.search_match_idx.map(|i| {
-                    if i == 0 { self.search_matches.len() - 1 } else { i - 1 }
-                }).unwrap_or(0);
+                let prev = self
+                    .search_match_idx
+                    .map(|i| if i == 0 { self.search_matches.len() - 1 } else { i - 1 })
+                    .unwrap_or(0);
                 self.jump_to_match(prev);
             }
             KeyCode::Char('s') if key.modifiers.is_empty() => {
                 self.state = AppState::SpeedSelection;
             }
-            // `v` toggles VBUS (TARGET-C) — only meaningful during live capture.
             KeyCode::Char('v') if key.modifiers.is_empty() && self.load_label.is_none() => {
-                match self.device_manager.toggle_vbus() {
-                    Ok(on) => {
-                        self.status_message = if on {
-                            "VBUS ON  (TARGET-C)".to_string()
-                        } else {
-                            "VBUS OFF (TARGET-C)".to_string()
-                        };
-                    }
-                    Err(e) => {
-                        self.status_message = format!("VBUS toggle failed: {e}");
-                    }
-                }
+                // VBUS toggle is async (BackendHandle::set_power_config); the
+                // actual call happens in `update()` via a pending-request flag
+                // isn't needed here since we can just spawn nothing — toggling
+                // is handled synchronously enough by queuing it for the next
+                // `update()` tick via `pending_power_toggle`.
+                self.pending_power_toggle = true;
             }
             _ => match self.active_view {
                 ActiveView::Traffic => self.handle_traffic_nav(key),
@@ -374,7 +403,9 @@ impl App {
             KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
                 self.search_input.push(c);
             }
-            KeyCode::Backspace => { self.search_input.pop(); }
+            KeyCode::Backspace => {
+                self.search_input.pop();
+            }
             KeyCode::Esc => {
                 self.search_mode = false;
                 self.search_input.clear();
@@ -392,98 +423,82 @@ impl App {
     }
 
     fn run_search(&mut self) {
-        let query = self.search_query.to_lowercase();
         self.search_matches.clear();
         self.search_match_idx = None;
-        if query.is_empty() { return; }
-
-        for (ti, item) in self.tree_items.iter().enumerate() {
-            if item.label.to_lowercase().contains(&query)
-                || item.details.to_lowercase().contains(&query)
-            {
-                self.search_matches.push((ti, None));
-            }
-            for (ci, pkt) in item.children.iter().enumerate() {
-                let dump  = hex_ascii_dump(&pkt.raw_bytes);
-                let hints = bytes_to_text_hints(&pkt.raw_bytes);
-                if pkt.label.to_lowercase().contains(&query)
-                    || pkt.details.to_lowercase().contains(&query)
-                    || dump.to_lowercase().contains(&query)
-                    || hints.to_lowercase().contains(&query)
-                {
-                    self.search_matches.push((ti, Some(ci)));
+        if self.search_query.is_empty() {
+            return;
+        }
+        if let Some(store) = self.items.as_mut() {
+            match store.search(&self.search_query) {
+                Ok(matches) => {
+                    self.search_matches =
+                        matches.into_iter().map(|(ti, ci)| (ti as usize, ci.map(|c| c as usize))).collect();
                 }
+                Err(e) => dbg_log!("search error: {e}"),
             }
         }
     }
 
     fn jump_to_match(&mut self, idx: usize) {
-        if self.search_matches.is_empty() { return; }
+        if self.search_matches.is_empty() {
+            return;
+        }
         let idx = idx % self.search_matches.len();
         self.search_match_idx = Some(idx);
         let (ti, ci) = self.search_matches[idx];
 
-        // Expand parent when jumping to a child row.
         if ci.is_some() {
-            if let Some(item) = self.tree_items.get_mut(ti) {
-                item.expanded = true;
+            if let Some(store) = self.items.as_mut() {
+                let _ = store.set_expanded(ti as u64, true);
             }
         }
 
-        let flat_idx = flat_top_row_index(&self.tree_items, ti)
-            .map(|top| top + ci.map(|c| 1 + c).unwrap_or(0));
+        let top = self.top_row_index(ti);
+        let flat_idx = top.map(|t| t + ci.map(|c| 1 + c).unwrap_or(0));
 
         if let Some(flat) = flat_idx {
             self.selected_row = Some(flat);
-            let len = flat_row_count(&self.tree_items);
+            let len = self.flat_len();
             self.clamp_scroll(len);
         }
     }
 
-    fn toggle_save(&mut self) {
-        if self.device_manager.is_saving() {
-            if let Err(e) = self.device_manager.stop_save() {
-                self.status_message = format!("Save error: {e}");
-            } else {
-                let name = self.save_label.take().unwrap_or_default();
-                self.status_message = format!("Saved → {name}");
-            }
-        } else {
-            let filename = crate::pcap::default_capture_filename();
-            let path = std::path::PathBuf::from(&filename);
-            match self.device_manager.start_save(path) {
-                Ok(p) => {
-                    let label = p.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or(filename);
-                    self.save_label = Some(label.clone());
-                    self.status_message = format!("Recording → {label}");
-                }
-                Err(e) => {
-                    self.status_message = format!("Cannot save: {e}");
-                }
-            }
+    /// Save everything decoded so far (live capture or a loaded file alike)
+    /// to a `.pcapng` file, as a one-shot snapshot — see
+    /// `CaptureSession::save_now` for why this doesn't require having
+    /// started saving before the capture began.
+    fn save_capture(&mut self) {
+        let Some(capture) = self.capture.as_mut() else { return };
+        if capture.is_saving() {
+            self.status_message = "Already saving…".to_string();
+            return;
+        }
+        let filename = crate::capture::default_capture_filename();
+        let path = std::path::PathBuf::from(&filename);
+        match capture.save_now(path) {
+            Ok(()) => self.status_message = format!("Saving → {filename}…"),
+            Err(e) => self.status_message = format!("Cannot save: {e}"),
         }
     }
 
     fn handle_traffic_nav(&mut self, key: KeyEvent) {
-        let len = flat_row_count(&self.tree_items);
+        let len = self.flat_len();
 
-        // Any key other than `g` clears the gg-pending state unless it is itself `g`.
         let is_g = key.code == KeyCode::Char('g') && key.modifiers.is_empty();
         if !is_g {
             self.g_pending = false;
         }
 
         if len == 0 {
-            if is_g { self.g_pending = false; }
+            if is_g {
+                self.g_pending = false;
+            }
             return;
         }
 
         let page = self.page_size.max(1);
 
         match key.code {
-            // ── Vertical movement ──────────────────────────────────────────
             KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() || key.code == KeyCode::Up => {
                 let cur = self.selected_row.unwrap_or(0);
                 self.selected_row = Some(cur.saturating_sub(1));
@@ -494,9 +509,6 @@ impl App {
                 self.selected_row = Some((cur + 1).min(len - 1));
                 self.clamp_scroll(len);
             }
-
-            // ── Page navigation ────────────────────────────────────────────
-            // Ctrl+d / Ctrl+u  — half page
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let half = (page / 2).max(1);
                 let cur = self.selected_row.unwrap_or(0);
@@ -509,25 +521,24 @@ impl App {
                 self.selected_row = Some(cur.saturating_sub(half));
                 self.clamp_scroll(len);
             }
-            // Ctrl+f / Ctrl+b or PageDown/PageUp — full page
-            KeyCode::PageDown | KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) || key.code == KeyCode::PageDown => {
+            KeyCode::PageDown | KeyCode::Char('f')
+                if key.modifiers.contains(KeyModifiers::CONTROL) || key.code == KeyCode::PageDown =>
+            {
                 let cur = self.selected_row.unwrap_or(0);
                 self.selected_row = Some((cur + page).min(len - 1));
                 self.clamp_scroll(len);
             }
-            KeyCode::PageUp | KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) || key.code == KeyCode::PageUp => {
+            KeyCode::PageUp | KeyCode::Char('b')
+                if key.modifiers.contains(KeyModifiers::CONTROL) || key.code == KeyCode::PageUp =>
+            {
                 let cur = self.selected_row.unwrap_or(0);
                 self.selected_row = Some(cur.saturating_sub(page));
                 self.clamp_scroll(len);
             }
-
-            // ── First / last ───────────────────────────────────────────────
-            // G  → last row
             KeyCode::Char('G') => {
                 self.selected_row = Some(len - 1);
                 self.scroll_offset = len.saturating_sub(page);
             }
-            // gg → first row  (g pressed twice)
             KeyCode::Char('g') if key.modifiers.is_empty() => {
                 if self.g_pending {
                     self.selected_row = Some(0);
@@ -536,36 +547,36 @@ impl App {
                 } else {
                     self.g_pending = true;
                 }
-                return; // don't fall through to the g_pending reset below
+                return;
             }
-
-            // ── Expand / collapse ──────────────────────────────────────────
-            // Right / l: expand only
             KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(idx) = self.selected_row {
-                    if let Some((ti, None)) = flat_index_resolve(&self.tree_items, idx) {
-                        if let Some(item) = self.tree_items.get_mut(ti) {
-                            if item.has_children() {
-                                item.expanded = true;
+                    if let Some((ti, None)) = self.resolve(idx) {
+                        let has_children =
+                            self.items.as_mut().map(|s| s.has_children(ti as u64).unwrap_or(false)).unwrap_or(false);
+                        if has_children {
+                            if let Some(store) = self.items.as_mut() {
+                                let _ = store.set_expanded(ti as u64, true);
                             }
                         }
                     }
                 }
             }
-            // Enter: toggle expand/collapse
             KeyCode::Enter => {
                 if let Some(idx) = self.selected_row {
-                    if let Some((ti, None)) = flat_index_resolve(&self.tree_items, idx) {
-                        if let Some(item) = self.tree_items.get_mut(ti) {
-                            if item.has_children() {
-                                item.expanded = !item.expanded;
-                                if !item.expanded {
-                                    // Move cursor back to the parent row.
-                                    let parent_row = flat_top_row_index(&self.tree_items, ti).unwrap_or(idx);
-                                    self.selected_row = Some(parent_row);
-                                    let new_len = flat_row_count(&self.tree_items);
-                                    self.clamp_scroll(new_len);
-                                }
+                    if let Some((ti, None)) = self.resolve(idx) {
+                        let has_children =
+                            self.items.as_mut().map(|s| s.has_children(ti as u64).unwrap_or(false)).unwrap_or(false);
+                        if has_children {
+                            let was_expanded = self.items.as_ref().map(|s| s.is_expanded(ti as u64)).unwrap_or(false);
+                            if let Some(store) = self.items.as_mut() {
+                                let _ = store.set_expanded(ti as u64, !was_expanded);
+                            }
+                            if was_expanded {
+                                let parent_row = self.top_row_index(ti).unwrap_or(idx);
+                                self.selected_row = Some(parent_row);
+                                let new_len = self.flat_len();
+                                self.clamp_scroll(new_len);
                             }
                         }
                     }
@@ -573,15 +584,13 @@ impl App {
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 if let Some(idx) = self.selected_row {
-                    if let Some((ti, _)) = flat_index_resolve(&self.tree_items, idx) {
-                        // Collapse the parent item.
-                        if let Some(item) = self.tree_items.get_mut(ti) {
-                            item.expanded = false;
+                    if let Some((ti, _)) = self.resolve(idx) {
+                        if let Some(store) = self.items.as_mut() {
+                            store.collapse(ti as u64);
                         }
-                        // Move cursor to the parent's top-level row.
-                        let parent_row = flat_top_row_index(&self.tree_items, ti).unwrap_or(idx);
+                        let parent_row = self.top_row_index(ti).unwrap_or(idx);
                         self.selected_row = Some(parent_row);
-                        let new_len = flat_row_count(&self.tree_items);
+                        let new_len = self.flat_len();
                         self.clamp_scroll(new_len);
                     }
                 }
@@ -593,10 +602,13 @@ impl App {
     fn handle_device_nav(&mut self, key: KeyEvent) {
         let rows = crate::ui::device_tree_rows(&self.usb_devices, &self.device_expanded);
         let count = rows.len();
-        if count == 0 { return; }
+        if count == 0 {
+            return;
+        }
 
-        // Clamp selection first.
-        if self.device_selected >= count { self.device_selected = count - 1; }
+        if self.device_selected >= count {
+            self.device_selected = count - 1;
+        }
 
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -629,7 +641,6 @@ impl App {
                 let step = (self.page_size / 2).max(1);
                 self.device_selected = self.device_selected.saturating_sub(step);
             }
-            // l / Right — expand; Enter — toggle expand/collapse
             KeyCode::Char('l') | KeyCode::Right => {
                 if let Some(row) = rows.get(self.device_selected) {
                     if let Some(key) = &row.expand_key {
@@ -645,13 +656,11 @@ impl App {
                     }
                 }
             }
-            // h / Left — collapse
             KeyCode::Char('h') | KeyCode::Left => {
                 if let Some(row) = rows.get(self.device_selected) {
                     if let Some(key) = &row.expand_key {
                         self.device_expanded.insert(key.clone(), false);
                     } else if self.device_selected > 0 {
-                        // Jump to parent node.
                         let indent = row.indent;
                         for i in (0..self.device_selected).rev() {
                             if rows[i].indent < indent && rows[i].expand_key.is_some() {
@@ -662,11 +671,12 @@ impl App {
                     }
                 }
             }
-            _ => { self.g_pending = false; }
+            _ => {
+                self.g_pending = false;
+            }
         }
         self.g_pending = false;
 
-        // Scroll to keep selection in view.
         let page = self.page_size.max(1);
         if self.device_selected < self.device_scroll {
             self.device_scroll = self.device_selected;
@@ -677,26 +687,73 @@ impl App {
 
     fn handle_plugin_nav(&mut self, key: KeyEvent) {
         let n_plugins = self.plugin_manager.len();
-        if n_plugins == 0 { return; }
+        if n_plugins == 0 {
+            return;
+        }
 
-        // When the active plugin has an internal list focused it wants j/k/Enter
-        // for itself rather than for plugin selection.
+        if !self.plugin_pane_focus {
+            match key.code {
+                KeyCode::Char('k') | KeyCode::Up if key.modifiers.is_empty() => {
+                    if self.plugin_selected > 0 {
+                        self.plugin_selected -= 1;
+                        self.plugin_scroll = 0;
+                    }
+                }
+                KeyCode::Char('j') | KeyCode::Down if key.modifiers.is_empty() => {
+                    if self.plugin_selected + 1 < n_plugins {
+                        self.plugin_selected += 1;
+                        self.plugin_scroll = 0;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.plugin_pane_focus = true;
+                    self.plugin_scroll = 0;
+                    self.g_pending = false;
+                    self.plugin_manager.dispatch_focus(self.plugin_selected);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         let captures = self.plugin_manager.plugin_captures_nav(self.plugin_selected);
 
         let dispatched = match key.code {
             KeyCode::Char('j') | KeyCode::Down if captures && key.modifiers.is_empty() => {
-                self.plugin_manager.dispatch_key(self.plugin_selected, 'j'); true
+                self.plugin_manager.dispatch_key(self.plugin_selected, 'j');
+                true
             }
             KeyCode::Char('k') | KeyCode::Up if captures && key.modifiers.is_empty() => {
-                self.plugin_manager.dispatch_key(self.plugin_selected, 'k'); true
+                self.plugin_manager.dispatch_key(self.plugin_selected, 'k');
+                true
             }
             KeyCode::Enter if captures => {
-                self.plugin_manager.dispatch_key(self.plugin_selected, '\r'); true
+                self.plugin_manager.dispatch_key(self.plugin_selected, '\r');
+                true
+            }
+            KeyCode::Char('G') if captures => {
+                self.plugin_manager.dispatch_key(self.plugin_selected, 'G');
+                true
+            }
+            KeyCode::Char('d') if captures && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.plugin_manager.dispatch_key_code(self.plugin_selected, KeyCode::PageDown);
+                true
+            }
+            KeyCode::Char('u') if captures && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.plugin_manager.dispatch_key_code(self.plugin_selected, KeyCode::PageUp);
+                true
+            }
+            KeyCode::PageDown if captures => {
+                self.plugin_manager.dispatch_key_code(self.plugin_selected, KeyCode::PageDown);
+                true
+            }
+            KeyCode::PageUp if captures => {
+                self.plugin_manager.dispatch_key_code(self.plugin_selected, KeyCode::PageUp);
+                true
             }
             _ => false,
         };
 
-        // After any plugin key dispatch, check for a pending nav request.
         if dispatched {
             if let Some(nav) = self.plugin_manager.take_nav_request(self.plugin_selected) {
                 self.handle_plugin_nav_request(nav);
@@ -706,20 +763,12 @@ impl App {
         }
 
         match key.code {
-            // Select previous / next plugin in the list
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.plugin_selected > 0 {
-                    self.plugin_selected -= 1;
-                    self.plugin_scroll = 0;
-                }
+            KeyCode::Char('j') | KeyCode::Down if key.modifiers.is_empty() => {
+                self.plugin_scroll = self.plugin_scroll.saturating_add(1);
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.plugin_selected + 1 < n_plugins {
-                    self.plugin_selected += 1;
-                    self.plugin_scroll = 0;
-                }
+            KeyCode::Char('k') | KeyCode::Up if key.modifiers.is_empty() => {
+                self.plugin_scroll = self.plugin_scroll.saturating_sub(1);
             }
-            // Scroll content pane
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let step = (self.page_size / 2).max(1);
                 self.plugin_scroll = self.plugin_scroll.saturating_add(step);
@@ -736,7 +785,11 @@ impl App {
             }
             KeyCode::Char('g') if key.modifiers.is_empty() => {
                 if self.g_pending {
-                    self.plugin_scroll = 0;
+                    if captures {
+                        self.plugin_manager.dispatch_key(self.plugin_selected, 'g');
+                    } else {
+                        self.plugin_scroll = 0;
+                    }
                     self.g_pending = false;
                 } else {
                     self.g_pending = true;
@@ -744,20 +797,24 @@ impl App {
                 }
             }
             KeyCode::Char('G') => {
-                self.plugin_scroll = usize::MAX / 2;
+                if captures {
+                    self.plugin_manager.dispatch_key(self.plugin_selected, 'G');
+                } else {
+                    self.plugin_scroll = usize::MAX / 2;
+                }
             }
-            // Forward Space, [, ], w, e to the active plugin.
             KeyCode::Char(c @ (' ' | '[' | ']' | 'w' | 'e')) if key.modifiers.is_empty() => {
                 self.plugin_manager.dispatch_key(self.plugin_selected, c);
                 if let Some(nav) = self.plugin_manager.take_nav_request(self.plugin_selected) {
                     self.handle_plugin_nav_request(nav);
                 }
             }
-            // Forward Left/Right arrows to the active plugin (seek).
             KeyCode::Left | KeyCode::Right if key.modifiers.is_empty() => {
                 self.plugin_manager.dispatch_key_code(self.plugin_selected, key.code);
             }
-            _ => { self.g_pending = false; }
+            _ => {
+                self.g_pending = false;
+            }
         }
         self.g_pending = false;
     }
@@ -765,25 +822,17 @@ impl App {
     fn handle_plugin_nav_request(&mut self, nav: PluginNavRequest) {
         match nav {
             PluginNavRequest::GotoTimestamp(ts) => {
-                // Find the first tree item at or after the target timestamp.
-                for (ti, item) in self.tree_items.iter().enumerate() {
-                    if item.timestamp_ns >= ts {
-                        if let Some(flat) = flat_top_row_index(&self.tree_items, ti) {
-                            self.selected_row = Some(flat);
-                            let len = flat_row_count(&self.tree_items);
-                            self.clamp_scroll(len);
-                            self.active_view = ActiveView::Traffic;
-                        }
-                        return;
+                let target = match self.items.as_mut() {
+                    Some(store) => store.top_index_at_or_after(ts).ok().flatten(),
+                    None => None,
+                };
+                if let Some(ti) = target {
+                    if let Some(flat) = self.top_row_index(ti as usize) {
+                        self.selected_row = Some(flat);
+                        let len = self.flat_len();
+                        self.clamp_scroll(len);
+                        self.active_view = ActiveView::Traffic;
                     }
-                }
-                // Timestamp past end — jump to last row.
-                if !self.tree_items.is_empty() {
-                    let last = flat_row_count(&self.tree_items) - 1;
-                    self.selected_row = Some(last);
-                    let len = last + 1;
-                    self.clamp_scroll(len);
-                    self.active_view = ActiveView::Traffic;
                 }
             }
         }
@@ -811,88 +860,125 @@ impl App {
                 self.device_check_counter += 1;
                 if self.device_check_counter >= 10 {
                     self.device_check_counter = 0;
-                    dbg_log!("update: polling for device");
-                    if let Some(info) = self.device_manager.find_device().await? {
-                        dbg_log!("update: device found → SpeedSelection");
-                        self.selected_device = Some(info);
+                    if let Some(device) = self.device_manager.first_device() {
+                        dbg_log!("update: device found ({}) → SpeedSelection", device.name);
+                        self.selected_device = Some(device);
                         self.state = AppState::SpeedSelection;
-                        self.status_message =
-                            "Device found!  Select USB speed:".to_string();
+                        self.status_message = "Device found!  Select USB speed:".to_string();
                         self.selected_speed_idx = 0;
                         self.selected_speed = Speed::High;
                     }
                 }
             }
             AppState::Connecting => {
-                // If the user opened a pcap file via the dialog, load it instead of
-                // opening the hardware device.
                 if let Some(path) = self.pending_load.take() {
-                    dbg_log!("update: Connecting → loading pcap {}", path.display());
-                    match self.start_load(path).await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            dbg_log!("update: pcap load error: {e}");
-                            self.state = AppState::Error;
-                            self.error_message = Some(format!("Failed to load pcap: {e}"));
-                        }
+                    dbg_log!("update: Connecting → loading {}", path.display());
+                    if let Err(e) = self.start_load(path).await {
+                        dbg_log!("update: load error: {e}");
+                        self.state = AppState::Error;
+                        self.error_message = Some(format!("Failed to load capture: {e}"));
                     }
                     return Ok(());
                 }
-                // If we came from pcap viewing (s key) the device scan may not
-                // have run yet — find it now before trying to open it.
-                if !self.device_manager.has_found_device() {
-                    dbg_log!("update: Connecting — no device cached, scanning first");
-                    match self.device_manager.find_device().await? {
+
+                let device = match self.selected_device.clone() {
+                    Some(d) => d,
+                    None => match self.device_manager.first_device() {
+                        Some(d) => {
+                            self.selected_device = Some(d.clone());
+                            d
+                        }
                         None => {
                             self.state = AppState::Error;
-                            self.error_message = Some("No Cynthion device found".to_string());
+                            self.error_message = Some("No capture device found".to_string());
                             return Ok(());
                         }
-                        Some(info) => {
-                            self.selected_device = Some(info);
-                        }
-                    }
-                }
-                dbg_log!("update: Connecting → calling open_device()");
-                match self.device_manager.open_device(self.selected_speed).await {
-                    Ok(()) => {
-                        dbg_log!("update: open_device() OK → Capturing");
-                        // Discard any previously loaded pcap and start fresh.
+                    },
+                };
+
+                dbg_log!("update: Connecting → starting capture on {}", device.name);
+                match CaptureSession::start_capture(&device, self.selected_speed).await {
+                    Ok(session) => {
+                        dbg_log!("update: capture started → Capturing");
+                        let reader = session.reader.clone();
                         self.clear_capture_state();
                         self.load_label = None;
-                        self.save_label = None;
-                        self.usb_devices = self.device_manager.discovered_devices();
+                        self.capture = Some(session);
+                        self.items = Some(ItemStore::new(reader));
                         self.state = AppState::Capturing;
                         self.status_message = format!(
                             "Capturing at {}  — Tab=views  s=speed  ↑↓=navigate  ←→=expand  q=quit",
-                            self.selected_speed
+                            self.selected_speed.description()
                         );
                     }
                     Err(e) => {
-                        dbg_log!("update: open_device() error: {e}");
+                        dbg_log!("update: start_capture error: {e}");
                         self.state = AppState::Error;
                         self.error_message = Some(format!("Failed to open device: {e}"));
                     }
                 }
             }
             AppState::Capturing => {
-                if let Some(txns) = self.device_manager.get_new_transactions().await? {
-                    // Auto-scroll only during live capture; loaded files start at the top.
-                    let auto_scroll = self.selected_row.is_none() && self.load_label.is_none();
-                    // Refresh device list once per batch.
-                    self.usb_devices = self.device_manager.discovered_devices();
-                    for txn in txns {
-                        // Feed transaction to plugins before consuming it.
-                        self.plugin_manager.on_transaction(&txn, &self.usb_devices);
-                        let item = TreeItem::from_transaction(txn);
-                        self.tree_items.push_back(item);
-                    }
-                    // Auto-scroll to bottom when nothing is selected.
-                    if auto_scroll {
-                        let flat_len = flat_row_count(&self.tree_items);
-                        if flat_len > 0 {
-                            self.scroll_offset = flat_len.saturating_sub(self.page_size);
+                if self.pending_power_toggle {
+                    self.pending_power_toggle = false;
+                    if let Some(capture) = self.capture.as_mut() {
+                        match capture.toggle_power().await {
+                            Ok(on) => {
+                                self.status_message =
+                                    if on { "VBUS ON  (TARGET-C)".to_string() } else { "VBUS OFF (TARGET-C)".to_string() };
+                            }
+                            Err(e) => {
+                                self.status_message = format!("VBUS toggle failed: {e}");
+                            }
                         }
+                    }
+                }
+
+                if let Some(capture) = self.capture.as_mut() {
+                    capture.poll();
+                    if let Some(result) = capture.poll_save() {
+                        self.status_message = match result {
+                            Ok(path) => {
+                                let label = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                format!("Saved → {label}")
+                            }
+                            Err(e) => format!("Save error: {e}"),
+                        };
+                    }
+                }
+
+                if let Some(store) = self.items.as_mut() {
+                    let before = self.last_synced_top;
+                    match plugin_bridge::sync(
+                        store,
+                        &mut self.plugin_manager,
+                        &mut self.last_synced_top,
+                        &mut self.plugin_sync_offset,
+                    ) {
+                        Ok(devices) => {
+                            if self.last_synced_top != before {
+                                dbg_log!(
+                                    "update: synced {} new top-level items (total item_count={}, packet_count={}, devices={})",
+                                    self.last_synced_top - before,
+                                    store.transaction_count(),
+                                    store.packet_count(),
+                                    devices.len()
+                                );
+                            }
+                            self.usb_devices = devices;
+                        }
+                        Err(e) => dbg_log!("update: plugin sync error: {e}"),
+                    }
+                }
+
+                let auto_scroll = self.selected_row.is_none() && self.load_label.is_none();
+                if auto_scroll {
+                    let flat_len = self.flat_len();
+                    if flat_len > 0 {
+                        self.scroll_offset = flat_len.saturating_sub(self.page_size);
                     }
                 }
             }
@@ -907,79 +993,71 @@ impl App {
 
     /// Flat rows visible in `[scroll_offset, scroll_offset + max_rows)`.
     /// Returns `(row, is_selected)` pairs.  Never allocates the full flat list.
-    pub fn visible_rows(&self, max_rows: usize) -> Vec<(FlatRow, bool)> {
-        flat_rows_window(&self.tree_items, self.scroll_offset, max_rows)
-            .into_iter()
-            .map(|(gi, row)| (row, Some(gi) == self.selected_row))
-            .collect()
+    pub fn visible_rows(&mut self, max_rows: usize) -> Vec<(FlatRow, bool)> {
+        let selected = self.selected_row;
+        let Some(store) = self.items.as_mut() else { return Vec::new() };
+        match store.flat_rows_window(self.scroll_offset as u64, max_rows as u64) {
+            Ok(rows) => rows.into_iter().map(|(gi, row)| (row, Some(gi as usize) == selected)).collect(),
+            Err(e) => {
+                dbg_log!("visible_rows error: {e}");
+                Vec::new()
+            }
+        }
     }
 
     /// Details text for the currently selected row.
-    /// Returns `(label, details)` or `None`.
-    pub fn selected_details(&self) -> Option<(String, String)> {
+    pub fn selected_details(&mut self) -> Option<(String, String)> {
         let flat_idx = self.selected_row?;
-        let (ti, ci) = flat_index_resolve(&self.tree_items, flat_idx)?;
-        let item = self.tree_items.get(ti)?;
-        if let Some(ci) = ci {
-            let pkt = item.children.get(ci)?;
-            Some((pkt.label.clone(), pkt.details.clone()))
-        } else {
-            Some((item.label.clone(), item.details.clone()))
-        }
+        let (ti, ci) = self.resolve(flat_idx)?;
+        self.items.as_mut()?.row_details(ti as u64, ci.map(|c| c as u64)).ok()
     }
 
     /// Raw bytes for the currently selected row (for hex+ASCII dump in detail pane).
-    pub fn selected_raw_bytes(&self) -> Option<Vec<u8>> {
+    pub fn selected_raw_bytes(&mut self) -> Option<Vec<u8>> {
         let flat_idx = self.selected_row?;
-        let (ti, ci) = flat_index_resolve(&self.tree_items, flat_idx)?;
-        let item = self.tree_items.get(ti)?;
-        if let Some(ci) = ci {
-            let pkt = item.children.get(ci)?;
-            if pkt.raw_bytes.is_empty() { None } else { Some(pkt.raw_bytes.clone()) }
-        } else {
-            // Top-level: collect all child raw bytes into one flat buffer.
-            let all: Vec<u8> = item.children.iter()
-                .flat_map(|p| p.raw_bytes.iter().copied())
-                .collect();
-            if all.is_empty() { None } else { Some(all) }
-        }
+        let (ti, ci) = self.resolve(flat_idx)?;
+        self.items.as_mut()?.row_raw_bytes(ti as u64, ci.map(|c| c as u64)).ok().flatten()
     }
 
     /// Current flat-row position (1-based) and total flat rows.
-    /// Returns `(0, total)` when nothing is selected.
-    pub fn selected_flat_position(&self) -> (usize, usize) {
-        let total = flat_row_count(&self.tree_items);
-        let pos   = self.selected_row.map(|r| r + 1).unwrap_or(0);
+    pub fn selected_flat_position(&mut self) -> (usize, usize) {
+        let total = self.flat_len();
+        let pos = self.selected_row.map(|r| r + 1).unwrap_or(0);
         (pos, total)
     }
 
-    /// Total number of top-level transaction nodes captured.
+    /// Total number of top-level rows captured.
     pub fn transaction_count(&self) -> usize {
-        self.tree_items.len()
+        self.items.as_ref().map(|s| s.transaction_count()).unwrap_or(0) as usize
     }
 
-    /// Total individual packets (summing all children, or 1 for leaf nodes).
+    /// Total individual packets captured.
     pub fn packet_count(&self) -> usize {
-        self.tree_items.iter().map(|i| {
-            if i.children.is_empty() { 1 } else { i.children.len() }
-        }).sum()
+        self.items.as_ref().map(|s| s.packet_count()).unwrap_or(0) as usize
     }
 
-    /// Color hint used by the UI when rendering a transaction kind.
-    pub fn kind_color(kind: TransactionKind) -> ratatui::style::Color {
+    pub fn is_saving(&self) -> bool {
+        self.capture.as_ref().map(|c| c.is_saving()).unwrap_or(false)
+    }
+
+    pub fn save_label(&self) -> Option<&str> {
+        self.capture.as_ref().and_then(|c| c.save_label())
+    }
+
+    /// Color hint used by the UI when rendering a row's kind.
+    pub fn kind_color(kind: RowKind) -> ratatui::style::Color {
         use ratatui::style::Color;
         match kind {
-            TransactionKind::Control      => Color::Cyan,
-            TransactionKind::BulkIn       => Color::Green,
-            TransactionKind::BulkOut      => Color::Blue,
-            TransactionKind::Interrupt    => Color::Magenta,
-            TransactionKind::Isochronous  => Color::LightYellow,
-            TransactionKind::SofGroup     => Color::DarkGray,
-            TransactionKind::Nak          => Color::Red,
-            TransactionKind::Stall        => Color::LightRed,
-            TransactionKind::Other        => Color::White,
+            RowKind::Control => Color::Cyan,
+            RowKind::BulkIn => Color::Green,
+            RowKind::BulkOut => Color::Blue,
+            RowKind::Interrupt => Color::Magenta,
+            RowKind::Isochronous => Color::LightYellow,
+            RowKind::Framing => Color::DarkGray,
+            RowKind::Polling => Color::Red,
+            RowKind::Ambiguous => Color::LightRed,
+            RowKind::Event => Color::Yellow,
+            RowKind::Other => Color::White,
         }
     }
 }
-
-

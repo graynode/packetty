@@ -15,7 +15,7 @@
 //!   Space  — play / stop captured audio
 //!   [  /  ] — cycle through captured streams
 
-use super::{PluginLine, PluginNavRequest, UsbPlugin};
+use crate::{PluginLine, PluginNavRequest, UsbPlugin, dbg_log};
 use crate::models::{PacketType, TransactionInfo, TransactionKind, UsbDeviceInfo};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -23,7 +23,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Block, Borders, Paragraph,
-        canvas::{Canvas, Line as CanvasLine, Points},
+        canvas::{Canvas, Context as CanvasContext, Line as CanvasLine},
     },
     Frame,
 };
@@ -136,6 +136,12 @@ struct SelectorUnit {
 #[derive(Debug, Clone)]
 struct AudioStreamInfo {
     interface_num: u8,
+    /// Which alternate setting of `interface_num` this format belongs to.
+    /// An interface commonly has several alt settings, each with its own
+    /// format (16-bit vs 24-bit, different sample rates, etc.) — only the
+    /// one actually selected via `SET_INTERFACE` is the one really on the
+    /// wire, so this is needed to tell them apart.
+    alt_setting: u8,
     terminal_link: u8,
     format_tag: u16,
     nr_channels: u8,
@@ -211,6 +217,13 @@ struct CapturedStream {
     ep_addr:        u8,     // with direction bit
     channels:       u8,
     bit_depth:      u8,
+    /// Wire byte stride per sample (`bSubframeSize` from the Format Type
+    /// descriptor). This is what actually determines where one sample ends
+    /// and the next begins on the wire — it can differ from
+    /// `ceil(bit_depth / 8)` (e.g. 16 significant bits packed in a 3-byte
+    /// subframe), and decoding by `bit_depth` alone in that case reads every
+    /// sample at the wrong offset, which sounds like pure noise.
+    subframe_size:  u8,
     sample_rate:    u32,
     /// All captured samples, normalised to i16.
     samples:        Vec<i16>,
@@ -218,12 +231,13 @@ struct CapturedStream {
 }
 
 impl CapturedStream {
-    fn new(dev_addr: u8, ep_addr: u8, channels: u8, bit_depth: u8, sample_rate: u32) -> Self {
+    fn new(dev_addr: u8, ep_addr: u8, channels: u8, bit_depth: u8, subframe_size: u8, sample_rate: u32) -> Self {
         Self {
             dev_addr,
             ep_addr,
             channels,
             bit_depth,
+            subframe_size,
             sample_rate,
             samples: Vec::new(),
             bytes_received: 0,
@@ -232,7 +246,11 @@ impl CapturedStream {
 
     fn push_bytes(&mut self, data: &[u8]) {
         self.bytes_received += data.len();
-        let bytes_per_sample = ((self.bit_depth as usize + 7) / 8).max(1);
+        let bytes_per_sample = if self.subframe_size > 0 {
+            self.subframe_size as usize
+        } else {
+            ((self.bit_depth as usize + 7) / 8).max(1)
+        };
 
         let mut i = 0;
         while i + bytes_per_sample <= data.len() {
@@ -317,8 +335,8 @@ pub struct AudioPlugin {
     streams:       HashMap<(u8, u8), CapturedStream>,
     announced:     Vec<u8>,
     /// Audio endpoints identified from streaming descriptors:
-    ///   (dev_addr, ep_num) → (channels, bit_depth, sample_rate)
-    audio_eps:     HashMap<(u8, u8), (u8, u8, u32)>,
+    ///   (dev_addr, ep_num) → (channels, bit_depth, subframe_size, sample_rate)
+    audio_eps:     HashMap<(u8, u8), (u8, u8, u8, u32)>,
 
     // Stream selection
     selected_idx:  usize,
@@ -465,24 +483,48 @@ impl AudioPlugin {
         let req    = setup[1];
         let wvalue = u16::from_le_bytes([setup[2], setup[3]]);
         let windex = u16::from_le_bytes([setup[4], setup[5]]);
+        let addr = txn.label.split("dev=").nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(0);
 
         // ── Standard SET_INTERFACE (stream start / stop) ──────────────────
         // bmRequestType=0x01: host→device, standard, interface
         if bm == 0x01 && req == 0x0B {
             let alt   = (wvalue & 0xFF) as u8;
             let iface = (windex & 0xFF) as u8;
-            let is_audio_iface = self.devices.values()
+            // The interface can have several alt settings (different bit
+            // depths/sample rates sharing the same endpoint); find the one
+            // actually being selected here and make it authoritative for
+            // that endpoint — otherwise whichever alt happened to be parsed
+            // first from the descriptor stays "active" even if a different
+            // one is what's actually streaming, which decodes as noise.
+            let selected = self.devices
+                .get(&addr)
+                .and_then(|d| d.streams.iter().find(|s| s.interface_num == iface && s.alt_setting == alt));
+            if let Some(s) = selected {
+                let ep_num = s.ep_addr & 0x0F;
+                let key = (s.nr_channels, s.bit_resolution, s.subframe_size, s.primary_sample_rate());
+                let format_changed = self.audio_eps.insert((addr, ep_num), key) != Some(key);
+                // Only drop an already-captured stream if the format this
+                // `SET_INTERFACE` selects is actually *different* from what
+                // was already active — some hosts re-assert the same alt
+                // setting repeatedly (e.g. on resume), and resetting on
+                // every one of those would throw away everything captured
+                // so far each time, leaving only whatever arrived after the
+                // last (often very late, or redundant) reset.
+                if format_changed {
+                    self.streams.remove(&(addr, ep_num));
+                }
+            }
+            let is_audio_iface = selected.is_some() || self.devices.values()
                 .flat_map(|d| d.streams.iter())
                 .any(|s| s.interface_num == iface);
             if is_audio_iface {
                 let label = if alt == 0 {
                     format!("Stream Stop  — IF{iface}")
                 } else {
-                    let fmt = self.devices.values()
-                        .flat_map(|d| d.streams.iter())
-                        .find(|s| s.interface_num == iface)
-                        .map(|s| s.format_desc())
-                        .unwrap_or_default();
+                    let fmt = selected.map(|s| s.format_desc()).unwrap_or_default();
                     format!("Stream Start — IF{iface}  alt={alt}  {fmt}")
                 };
                 self.media_events.push(MediaEvent { timestamp_ns: txn.timestamp_ns, label });
@@ -532,11 +574,6 @@ impl AudioPlugin {
             .collect();
         if resp.len() < 9 { return; }
 
-        let addr = txn.label.split("dev=").nth(1)
-            .and_then(|s| s.split_whitespace().next())
-            .and_then(|s| s.parse::<u8>().ok())
-            .unwrap_or(0);
-
         self.parse_audio_config(addr, &resp);
     }
 
@@ -566,6 +603,7 @@ impl AudioPlugin {
                 if in_as_iface && cur_alt > 0 && as_channels > 0 && as_ep_addr != 0 {
                     let stream = AudioStreamInfo {
                         interface_num: cur_if_num,
+                        alt_setting:   cur_alt,
                         terminal_link: as_link,
                         format_tag:    as_format_tag,
                         nr_channels:   as_channels,
@@ -576,10 +614,20 @@ impl AudioPlugin {
                     };
                     let ep_num = as_ep_addr & 0x0F;
                     let sr = stream.primary_sample_rate();
-                    if !dev.streams.iter().any(|s| s.ep_addr == as_ep_addr) {
+                    // An interface commonly has several alt settings (e.g.
+                    // 16-bit vs 24-bit), each reusing the same endpoint
+                    // address — keep every one (keyed by interface+alt, not
+                    // just endpoint) so `SET_INTERFACE` can later look up
+                    // exactly which alt's format is actually active, instead
+                    // of silently keeping whichever alt happened to be
+                    // parsed first even if a different one gets selected.
+                    if !dev.streams.iter().any(|s| s.interface_num == cur_if_num && s.alt_setting == cur_alt) {
                         dev.streams.push(stream);
-                        // Register endpoint for data capture.
-                        self.audio_eps.insert((addr, ep_num), (as_channels, as_bits, sr));
+                        // Best-effort default in case a stream is somehow
+                        // never seen going through `SET_INTERFACE` (e.g. the
+                        // capture started mid-stream); the SET_INTERFACE
+                        // handler below corrects this once observed.
+                        self.audio_eps.entry((addr, ep_num)).or_insert((as_channels, as_bits, as_subframe, sr));
                     }
                 }
             };
@@ -730,7 +778,7 @@ impl AudioPlugin {
             .and_then(|s| s.parse::<u8>().ok())
             .unwrap_or(0);
 
-        let (channels, bit_depth, sample_rate) = match self.audio_eps.get(&(addr, ep_num)) {
+        let (channels, bit_depth, subframe_size, sample_rate) = match self.audio_eps.get(&(addr, ep_num)) {
             Some(&v) => v,
             None => return,
         };
@@ -750,7 +798,7 @@ impl AudioPlugin {
 
         let is_new = !self.streams.contains_key(&(addr, ep_num));
         let stream = self.streams.entry((addr, ep_num)).or_insert_with(|| {
-            CapturedStream::new(addr, ep_with_dir, channels, bit_depth, sample_rate)
+            CapturedStream::new(addr, ep_with_dir, channels, bit_depth, subframe_size, sample_rate)
         });
         stream.push_bytes(&payload);
 
@@ -1155,8 +1203,8 @@ impl UsbPlugin for AudioPlugin {
                     if let Some(stream) = self.streams.get(&keys[sel]) {
                         let path = format!("audio_stream_{}_{}.wav", stream.dev_addr, stream.ep_addr);
                         match write_wav(&stream.samples, stream.channels, stream.sample_rate, &path) {
-                            Ok(()) => crate::dbg_log!("write_wav: saved {}", path),
-                            Err(e) => crate::dbg_log!("write_wav: error: {e}"),
+                            Ok(()) => dbg_log!("write_wav: saved {}", path),
+                            Err(e) => dbg_log!("write_wav: error: {e}"),
                         }
                     }
                 }
@@ -1281,8 +1329,15 @@ fn render_waveform(
         [s[0], s[1]]
     };
 
-    // Number of display columns; braille cells are 2 dots wide.
-    let n_pts = (wav_area.width as usize * 2).max(4);
+    // One display column per terminal column: using the `HalfBlock` marker
+    // (solid ▀/▄/█ glyphs, 1x2 "pixels" per cell) instead of `Braille`. Dense
+    // Braille fills are prone to a periodic horizontal seam in terminals
+    // whose font/line-height doesn't tile the dot glyphs with zero gap
+    // between rows — every row of the waveform (every 4 braille dots) shows
+    // a faint gap, which is exactly what a solid full-width waveform doesn't
+    // want. Half-block glyphs are simple filled rectangles that every
+    // monospace font renders identically with no such seam.
+    let n_pts = (wav_area.width as usize).max(4);
     let w     = n_pts as f64;
 
     // Cursor x in display coordinates (0..w), if playing.
@@ -1291,6 +1346,9 @@ fn render_waveform(
     });
 
     let is_stereo = stream.channels >= 2;
+    // Auto-scale to the loudest sample actually captured instead of the
+    // fixed i16 range, so quiet audio still fills the display height.
+    let norm = peak_amplitude(stream);
 
     if is_stereo {
         let [left_area, right_area] = {
@@ -1301,15 +1359,16 @@ fn render_waveform(
             [s[0], s[1]]
         };
 
-        let pts_l = all_channel_points(stream, 0, n_pts);
-        let pts_r = all_channel_points(stream, 1, n_pts);
+        let env_l = channel_envelope(stream, 0, n_pts, norm);
+        let env_r = channel_envelope(stream, 1, n_pts, norm);
 
         f.render_widget(
             Canvas::default()
+                .marker(ratatui::symbols::Marker::HalfBlock)
                 .x_bounds([0.0, w])
                 .y_bounds([-1.0, 1.0])
                 .paint(move |ctx| {
-                    ctx.draw(&Points { coords: &pts_l, color: Color::LightGreen });
+                    draw_envelope(ctx, &env_l, Color::LightGreen);
                     if let Some(cx) = cursor_x {
                         ctx.draw(&CanvasLine { x1: cx, y1: -1.0, x2: cx, y2: 1.0, color: Color::White });
                     }
@@ -1318,10 +1377,11 @@ fn render_waveform(
         );
         f.render_widget(
             Canvas::default()
+                .marker(ratatui::symbols::Marker::HalfBlock)
                 .x_bounds([0.0, w])
                 .y_bounds([-1.0, 1.0])
                 .paint(move |ctx| {
-                    ctx.draw(&Points { coords: &pts_r, color: Color::LightBlue });
+                    draw_envelope(ctx, &env_r, Color::LightBlue);
                     if let Some(cx) = cursor_x {
                         ctx.draw(&CanvasLine { x1: cx, y1: -1.0, x2: cx, y2: 1.0, color: Color::White });
                     }
@@ -1329,13 +1389,14 @@ fn render_waveform(
             right_area,
         );
     } else {
-        let pts = all_channel_points(stream, 0, n_pts);
+        let env = channel_envelope(stream, 0, n_pts, norm);
         f.render_widget(
             Canvas::default()
+                .marker(ratatui::symbols::Marker::HalfBlock)
                 .x_bounds([0.0, w])
                 .y_bounds([-1.0, 1.0])
                 .paint(move |ctx| {
-                    ctx.draw(&Points { coords: &pts, color: Color::LightGreen });
+                    draw_envelope(ctx, &env, Color::LightGreen);
                     if let Some(cx) = cursor_x {
                         ctx.draw(&CanvasLine { x1: cx, y1: -1.0, x2: cx, y2: 1.0, color: Color::White });
                     }
@@ -1364,9 +1425,45 @@ fn render_waveform(
     );
 }
 
-/// Build (x, y) pairs covering the *entire* capture downsampled to `n` display columns.
-/// Each column takes the peak-amplitude sample in its bin so transients stay visible.
-fn all_channel_points(stream: &CapturedStream, ch: usize, n: usize) -> Vec<(f64, f64)> {
+/// Draw a `(x, min_y, max_y)` envelope as a filled-looking waveform: a
+/// vertical bar per column, extended ("dilated") to cover the tallest
+/// high/lowest low of its immediate neighbours as well as its own.
+///
+/// A bar drawn only over each column's own (min, max) leaves no way to
+/// connect to a neighbour whose range doesn't overlap — columns are only
+/// one dot apart, so a Bresenham line "connecting" two such bars is nearly
+/// vertical over a 1-pixel run, and steep Bresenham lines alternate which
+/// of the two endpoints' x gets each y row. That painted only about half
+/// the rows needed to extend the shorter column's bar up to the taller
+/// one, producing a periodic dashed/perforated edge instead of a solid
+/// fill wherever the amplitude changes column to column (i.e. almost
+/// continuously, in real audio). Dilating each column's own bar to match
+/// its neighbours guarantees adjacent bars overlap and the fill is solid,
+/// with no separate connecting lines needed at all.
+fn draw_envelope(ctx: &mut CanvasContext, envelope: &[(f64, f64, f64)], color: Color) {
+    let n = envelope.len();
+    for i in 0..n {
+        let (x, mut lo, mut hi) = envelope[i];
+        if i > 0 {
+            lo = lo.min(envelope[i - 1].1);
+            hi = hi.max(envelope[i - 1].2);
+        }
+        if i + 1 < n {
+            lo = lo.min(envelope[i + 1].1);
+            hi = hi.max(envelope[i + 1].2);
+        }
+        ctx.draw(&CanvasLine { x1: x, y1: lo, x2: x, y2: hi, color });
+    }
+}
+
+/// Build a per-column min/max envelope covering the *entire* capture,
+/// downsampled to `n` display columns — the standard technique waveform
+/// editors use (Audacity, DAWs, etc.) so the true shape of the waveform is
+/// visible even when a column spans thousands of samples: each column's
+/// vertical line spans the full amplitude range that occurred within it,
+/// rather than a single peak sample, which is what turned the display into
+/// a scatter of disconnected dots instead of a recognisable waveform.
+fn channel_envelope(stream: &CapturedStream, ch: usize, n: usize, norm: f64) -> Vec<(f64, f64, f64)> {
     let stride = stream.channels as usize;
     if stride == 0 || n == 0 { return vec![]; }
     let ch = ch.min(stride - 1);
@@ -1374,28 +1471,62 @@ fn all_channel_points(stream: &CapturedStream, ch: usize, n: usize) -> Vec<(f64,
     if total_frames == 0 { return vec![]; }
 
     if total_frames <= n {
-        // Enough room to plot every frame directly.
+        // Enough room to plot every frame directly — one column, one sample.
         (0..total_frames)
             .map(|f| {
                 let x = f as f64 * n as f64 / total_frames as f64;
-                let y = stream.samples[f * stride + ch] as f64 / 32768.0;
-                (x, y)
+                let y = stream.samples[f * stride + ch] as f64 / norm;
+                (x, y, y)
             })
             .collect()
     } else {
-        // Downsample: pick the peak-amplitude sample per display column.
+        // Downsample: each column spans the min..max of every frame in its bin.
         (0..n)
             .map(|col| {
                 let start = col * total_frames / n;
                 let end   = ((col + 1) * total_frames / n).min(total_frames);
-                let peak  = (start..end)
-                    .map(|f| stream.samples[f * stride + ch])
-                    .max_by_key(|s| s.unsigned_abs())
-                    .unwrap_or(0);
-                (col as f64, peak as f64 / 32768.0)
+                let (mut lo, mut hi) = (0i16, 0i16);
+                for f in start..end {
+                    let s = stream.samples[f * stride + ch];
+                    if s < lo { lo = s; }
+                    if s > hi { hi = s; }
+                }
+                (col as f64, lo as f64 / norm, hi as f64 / norm)
             })
             .collect()
     }
+}
+
+/// Normalisation factor for the waveform display: the 99.5th percentile of
+/// `|sample|` across the whole (all-channel) capture, with a bit of headroom
+/// added on top, and a floor so a silent/near-silent stream doesn't get
+/// divided by ~0 and blown up into full-scale-looking noise.
+///
+/// This used to be the *maximum* sample, to auto-scale the waveform to fill
+/// the available height regardless of how quiet the source audio is (fixed
+/// i16-range normalisation compressed everything into a thin line hugging
+/// the centre). But real audio has a high crest factor — brief transients
+/// (drum hits, clicks) many times louder than the sustained level around
+/// them — so normalising to the single loudest sample in the whole capture
+/// made every quieter, perfectly normal-level passage collapse to a barely
+/// visible line, with only the rare transient reaching full height: visually
+/// almost the same "empty" look as the original bug, just with occasional
+/// spikes instead of none. A high percentile ignores that top sliver of
+/// outliers, so the display scales to what the audio is *usually* doing.
+/// A too-low percentile overcorrects the other way though — most of the
+/// waveform then routinely exceeds the display's own scale and clips flat
+/// against the top/bottom edge, looking distorted/"too loud" — so this
+/// sits close to the true peak (99.5th, not 98th) and adds 15% headroom on
+/// top so ordinary peaks don't ride the very edge of the display.
+fn peak_amplitude(stream: &CapturedStream) -> f64 {
+    const FLOOR: i16 = 200;
+    if stream.samples.is_empty() {
+        return FLOOR as f64;
+    }
+    let mut abs: Vec<u16> = stream.samples.iter().map(|&s| s.unsigned_abs()).collect();
+    let idx = ((abs.len() as f64 * 0.995) as usize).min(abs.len() - 1);
+    let (_, &mut nth, _) = abs.select_nth_unstable(idx);
+    (nth as f64 * 1.15).max(FLOOR as f64)
 }
 
 // ── WAV export ────────────────────────────────────────────────────────────────
@@ -1451,7 +1582,7 @@ fn play_audio(
 ) {
     let total_frames = samples.len() / channels.max(1) as usize;
     let start_frame  = start_frame.min(total_frames.saturating_sub(1));
-    crate::dbg_log!(
+    dbg_log!(
         "play_audio: start — {} samples ({} frames), {} ch, {} Hz, start_frame={}",
         samples.len(), total_frames, channels, sample_rate, start_frame
     );
@@ -1459,14 +1590,14 @@ fn play_audio(
     let (_stream, handle) = match rodio::OutputStream::try_default() {
         Ok(s) => s,
         Err(e) => {
-            crate::dbg_log!("play_audio: OutputStream::try_default failed: {e}");
+            dbg_log!("play_audio: OutputStream::try_default failed: {e}");
             return;
         }
     };
     let sink = match rodio::Sink::try_new(&handle) {
         Ok(s) => s,
         Err(e) => {
-            crate::dbg_log!("play_audio: Sink::try_new failed: {e}");
+            dbg_log!("play_audio: Sink::try_new failed: {e}");
             return;
         }
     };
@@ -1479,7 +1610,7 @@ fn play_audio(
         samples[skip_samples..].to_vec(),
     );
     sink.append(source);
-    crate::dbg_log!("play_audio: sink started");
+    dbg_log!("play_audio: sink started");
 
     let wall_start = std::time::Instant::now();
     while !sink.empty() && !stop.load(Ordering::Relaxed) {
@@ -1488,5 +1619,5 @@ fn play_audio(
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
     sink.stop();
-    crate::dbg_log!("play_audio: done (stop_flag={})", stop.load(Ordering::Relaxed));
+    dbg_log!("play_audio: done (stop_flag={})", stop.load(Ordering::Relaxed));
 }

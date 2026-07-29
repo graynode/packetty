@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 use crate::app::{App, AppState, ActiveView};
-use crate::models::{TransactionKind, UsbDeviceInfo, UsbConfigInfo, UsbInterfaceInfo, UsbEndpointInfo, hex_ascii_dump};
+use crate::models::{RowKind, UsbDeviceInfo, UsbConfigInfo, UsbInterfaceInfo, UsbEndpointInfo, hex_ascii_dump};
 use std::collections::HashMap;
 
 const PLUGIN_LIST_WIDTH: u16 = 28;
@@ -47,13 +47,8 @@ fn draw_waiting(f: &mut Frame, main: Rect, status: Rect, app: &App) {
     let text = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "⏳  Searching for Cynthion USB analyzer…",
+            "⏳  Searching for Cynthion compatible USB analyzer…",
             Style::default().fg(Color::Yellow),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "VID: 0x1d50   PID: 0x615b",
-            Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -89,7 +84,7 @@ fn draw_speed_selection(f: &mut Frame, main: Rect, status: Rect, app: &App) {
                 Style::default()
             };
             let prefix = if selected { "▶ " } else { "  " };
-            ListItem::new(format!("{prefix}{speed}")).style(style)
+            ListItem::new(format!("{prefix}{}", speed.description())).style(style)
         })
         .collect();
 
@@ -155,9 +150,9 @@ fn draw_capture(f: &mut Frame, main: Rect, status: Rect, app: &mut App) {
         format!("/{} [no matches]", app.search_query)
     } else if let Some(ref name) = app.load_label {
         format!("Loaded: {name}")
-    } else if app.device_manager.is_saving() {
-        let name = app.save_label.as_deref().unwrap_or("capture.pcap");
-        format!("● REC {name}")
+    } else if app.is_saving() {
+        let name = app.save_label().unwrap_or("capture.pcapng");
+        format!("● Saving → {name}")
     } else {
         app.status_message.clone()
     };
@@ -169,7 +164,7 @@ fn draw_capture(f: &mut Frame, main: Rect, status: Rect, app: &mut App) {
     };
     let hint = format!(
         "Tab=views  {}  o=open  j/k=↑↓  Ctrl+d/u=½pg  G/gg=last/first  {}  q=quit  txns={}  pkts={}  [{}]",
-        if app.load_label.is_some() { "/=search  n/p=next/prev  s=capture" } else { "s=speed  Ctrl+S=save" },
+        if app.load_label.is_some() { "/=search  n/p=next/prev  s=capture  Ctrl+S=save" } else { "s=speed  Ctrl+S=save" },
         if app.load_label.is_none() { "h/l=←→" } else { "" },
         app.transaction_count(),
         app.packet_count(),
@@ -281,7 +276,7 @@ fn draw_packet_tree(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(List::new(items).block(block), area);
 }
 
-fn draw_packet_details(f: &mut Frame, area: Rect, app: &App) {
+fn draw_packet_details(f: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::default()
         .title(" Details ")
         .borders(Borders::ALL);
@@ -406,27 +401,49 @@ fn draw_plugins_view(f: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Min(1),
     ]).areas(area);
 
+    let pane_focus = app.plugin_pane_focus;
+
     // ── Plugin list ──────────────────────────────────────────────────────────
+    let list_focused = !pane_focus;
+    let list_border_color = if list_focused { Color::Cyan } else { Color::DarkGray };
+    let list_title_style  = if list_focused {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     let list_block = Block::default()
         .title(" Plugins ")
-        .borders(Borders::ALL);
+        .title_style(list_title_style)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(list_border_color));
 
     let list_items: Vec<ListItem> = plugins.iter().enumerate().map(|(i, p)| {
         let selected = i == app.plugin_selected;
         let active   = p.is_active();
         let indicator = if active { "●" } else { "○" };
         let indicator_color = if active { Color::Green } else { Color::DarkGray };
-        let name_color = if selected { Color::Black } else if active { Color::White } else { Color::DarkGray };
-        let bg = if selected { Color::Cyan } else { Color::Reset };
+
+        // When list is focused, selected row is highlighted cyan; otherwise just white.
+        let (name_color, bg) = if selected && list_focused {
+            (Color::Black, Color::Cyan)
+        } else if selected {
+            (Color::Cyan, Color::Reset)
+        } else if active {
+            (Color::White, Color::Reset)
+        } else {
+            (Color::DarkGray, Color::Reset)
+        };
 
         // Truncate name to fit the pane.
         let max_name = PLUGIN_LIST_WIDTH as usize - 5;
         let name: String = p.name().chars().take(max_name).collect();
 
+        let hint = if selected && list_focused { " ↵" } else { "" };
+
         let line = Line::from(vec![
             Span::styled(format!(" {indicator} "), Style::default().fg(indicator_color).bg(bg)),
-            Span::styled(name, Style::default().fg(name_color).bg(bg)
-                .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() })),
+            Span::styled(format!("{name}{hint}"), Style::default().fg(name_color).bg(bg)
+                .add_modifier(if selected && list_focused { Modifier::BOLD } else { Modifier::empty() })),
         ]);
         ListItem::new(line)
     }).collect();
@@ -436,10 +453,20 @@ fn draw_plugins_view(f: &mut Frame, area: Rect, app: &mut App) {
     // ── Content pane ─────────────────────────────────────────────────────────
     let idx = app.plugin_selected.min(plugins.len() - 1);
 
+    let content_border_color = if pane_focus { Color::Cyan } else { Color::DarkGray };
+    let content_title_style  = if pane_focus {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let focus_hint = if pane_focus { "  Esc=back" } else { "" };
+
     // Draw the outer border block and compute the inner area.
     let content_block = Block::default()
-        .title(format!(" {} ", plugins[idx].name()))
-        .borders(Borders::ALL);
+        .title(format!(" {}{} ", plugins[idx].name(), focus_hint))
+        .title_style(content_title_style)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(content_border_color));
     let inner = content_block.inner(content_area);
     f.render_widget(content_block, content_area);
 
@@ -762,8 +789,8 @@ fn render_status(f: &mut Frame, area: Rect, left: &str, right: &str) {
     );
 }
 
-// Silence unused import warning – TransactionKind is used via App::kind_color.
-const _: fn() = || { let _ = TransactionKind::Other; };
+// Silence unused import warning – RowKind is used via App::kind_color.
+const _: fn() = || { let _ = RowKind::Other; };
 
 // ---------------------------------------------------------------------------
 // Help popup
@@ -869,10 +896,11 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                         entry!("/",       "Open search");
                         entry!("n / p",   "Next / previous match");
                         entry!("s",       "Start a new live capture");
+                        entry!("Ctrl+S",  "Save capture to .pcapng");
                     } else {
                         entry!("s",       "Change capture speed");
                         entry!("v",       "Toggle VBUS (TARGET-C)");
-                        entry!("Ctrl+S",  "Start / stop saving to .pcap");
+                        entry!("Ctrl+S",  "Save capture to .pcapng");
                     }
                 }
 
@@ -941,4 +969,3 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
 
     out
 }
-

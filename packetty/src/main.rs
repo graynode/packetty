@@ -1,9 +1,10 @@
 mod app;
 mod ui;
-mod backend;
+mod device;
+mod capture;
+mod item;
 mod models;
-mod pcap;
-mod plugins;
+mod plugin_bridge;
 
 use anyhow::Result;
 use app::App;
