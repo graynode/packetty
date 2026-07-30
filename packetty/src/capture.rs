@@ -9,8 +9,11 @@
 //! periodic `CaptureSnapshot`s.
 
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
@@ -68,6 +71,23 @@ impl FileSaver {
     }
 }
 
+/// Wraps a `Read` source, tallying bytes read into a shared counter so
+/// load progress can be reported from outside the (blocking, background-
+/// thread-owned) loader — `total_bytes` (the file size, known up front)
+/// versus this counter gives a fraction-complete for the status bar.
+struct CountingReader<R> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
 fn is_pcap_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -99,17 +119,18 @@ fn convert_loader_item(item: LoaderItem<impl GenericPacket>) -> FileEvent {
 }
 
 enum FileLoader {
-    Pcap(PcapLoader<File>),
-    PcapNg(PcapNgLoader<File>),
+    Pcap(PcapLoader<CountingReader<File>>),
+    PcapNg(PcapNgLoader<CountingReader<File>>),
 }
 
 impl FileLoader {
-    fn open(path: &Path) -> Result<Self> {
+    fn open(path: &Path, bytes_read: Arc<AtomicU64>) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let counting = CountingReader { inner: file, count: bytes_read };
         if is_pcap_extension(path) {
-            Ok(FileLoader::Pcap(PcapLoader::new(file)?))
+            Ok(FileLoader::Pcap(PcapLoader::new(counting)?))
         } else {
-            Ok(FileLoader::PcapNg(PcapNgLoader::new(file)?))
+            Ok(FileLoader::PcapNg(PcapNgLoader::new(counting)?))
         }
     }
 
@@ -134,6 +155,10 @@ pub struct CaptureSession {
     snapshot_rx: std_mpsc::Receiver<CaptureSnapshot>,
     save_rx: Option<std_mpsc::Receiver<Result<PathBuf, String>>>,
     save_label: Option<String>,
+    /// `(total file size, bytes read so far)` when this session is loading
+    /// from a file; `None` for a live capture, or if the file size couldn't
+    /// be determined up front.
+    load_progress: Option<(u64, Arc<AtomicU64>)>,
     backend_handle: Option<Box<dyn BackendHandle>>,
     backend_stop: Option<BackendStop>,
     decoder_thread: Option<JoinHandle<()>>,
@@ -193,6 +218,7 @@ impl CaptureSession {
             snapshot_rx,
             save_rx: None,
             save_label: None,
+            load_progress: None,
             backend_handle: Some(backend_handle),
             backend_stop: Some(stop),
             decoder_thread: Some(decoder_thread),
@@ -205,8 +231,12 @@ impl CaptureSession {
         let (writer, reader) = create_capture()?;
         let (snapshot_tx, snapshot_rx) = std_mpsc::channel();
 
+        let total_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let bytes_read = Arc::new(AtomicU64::new(0));
+        let load_progress = (total_bytes > 0).then(|| (total_bytes, Arc::clone(&bytes_read)));
+
         let decoder_thread = std::thread::spawn(move || {
-            run_load_thread(writer, path, snapshot_tx);
+            run_load_thread(writer, path, snapshot_tx, bytes_read);
         });
 
         Ok(CaptureSession {
@@ -215,10 +245,21 @@ impl CaptureSession {
             snapshot_rx,
             save_rx: None,
             save_label: None,
+            load_progress,
             backend_handle: None,
             backend_stop: None,
             decoder_thread: Some(decoder_thread),
         })
+    }
+
+    /// Fraction (0.0..=1.0) of the source file read so far, if this session
+    /// is loading from a file and the file size was determined up front.
+    /// `None` for a live capture (there's no fixed "total" to measure
+    /// against).
+    pub fn load_progress(&self) -> Option<f32> {
+        let (total, counter) = self.load_progress.as_ref()?;
+        let read = counter.load(Ordering::Relaxed);
+        Some((read as f32 / *total as f32).min(1.0))
     }
 
     /// Drain any pending snapshots (keeping only the most recent) so the
@@ -422,7 +463,12 @@ fn run_capture_thread(
     }
 }
 
-fn run_load_thread(writer: CaptureWriter, path: PathBuf, snapshot_tx: std_mpsc::Sender<CaptureSnapshot>) {
+fn run_load_thread(
+    writer: CaptureWriter,
+    path: PathBuf,
+    snapshot_tx: std_mpsc::Sender<CaptureSnapshot>,
+    bytes_read: Arc<AtomicU64>,
+) {
     let mut decoder = match Decoder::new(writer) {
         Ok(d) => d,
         Err(e) => {
@@ -432,7 +478,7 @@ fn run_load_thread(writer: CaptureWriter, path: PathBuf, snapshot_tx: std_mpsc::
     };
 
     let result: Result<()> = (|| {
-        let mut loader = FileLoader::open(&path)?;
+        let mut loader = FileLoader::open(&path, bytes_read)?;
         let mut count: u64 = 0;
         loop {
             match loader.next() {

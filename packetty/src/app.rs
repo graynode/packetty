@@ -952,11 +952,13 @@ impl App {
 
                 if let Some(store) = self.items.as_mut() {
                     let before = self.last_synced_top;
+                    let fast = self.capture.as_ref().map(|c| !c.is_live()).unwrap_or(false);
                     match plugin_bridge::sync(
                         store,
                         &mut self.plugin_manager,
                         &mut self.last_synced_top,
                         &mut self.plugin_sync_offset,
+                        fast,
                     ) {
                         Ok(devices) => {
                             if self.last_synced_top != before {
@@ -1042,6 +1044,39 @@ impl App {
 
     pub fn save_label(&self) -> Option<&str> {
         self.capture.as_ref().and_then(|c| c.save_label())
+    }
+
+    /// True while a file load is still in progress (background decode
+    /// thread hasn't reached the end of the file yet).
+    pub fn is_loading(&self) -> bool {
+        self.load_label.is_some() && self.capture.as_ref().map(|c| !c.complete()).unwrap_or(false)
+    }
+
+    /// Fraction (0.0..=1.0) of the file read so far, if known. `None` while
+    /// not loading, or if the file size couldn't be determined up front.
+    pub fn load_progress(&self) -> Option<f32> {
+        self.capture.as_ref().and_then(|c| c.load_progress())
+    }
+
+    /// True while a loaded file's decoded items are still being fed to the
+    /// plugin decoders (CDC/HID/Audio/HCI) — this trails file loading itself
+    /// since it's driven by a separate incremental sync (`plugin_bridge::
+    /// sync`), so the Plugins pane can lag behind "Loaded" even once the
+    /// underlying file is fully decoded.
+    pub fn is_syncing_plugins(&self) -> bool {
+        !self.is_loading()
+            && self.load_label.is_some()
+            && self.items.as_ref().map(|s| self.last_synced_top < s.item_count()).unwrap_or(false)
+    }
+
+    /// Fraction (0.0..=1.0) of top-level items synced to plugins so far.
+    pub fn plugin_sync_progress(&self) -> Option<f32> {
+        let store = self.items.as_ref()?;
+        let total = store.item_count();
+        if total == 0 {
+            return None;
+        }
+        Some((self.last_synced_top as f32 / total as f32).min(1.0))
     }
 
     /// Color hint used by the UI when rendering a row's kind.

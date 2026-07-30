@@ -35,6 +35,21 @@ const MAX_PER_SYNC: u64 = 500;
 /// everything already sent on every call.
 const MAX_PACKETS_PER_SYNC: u64 = 4000;
 
+/// Same idea as [`MAX_PER_SYNC`]/[`MAX_PACKETS_PER_SYNC`], but for replaying
+/// an already-loaded file rather than a live capture (`sync`'s `fast`
+/// parameter). Measured against a real ~690k-packet capture: fully lifting
+/// the caps (no bound at all) just moves the *same total* per-packet DB-query
+/// work into one call instead of spreading it out — about 20 seconds of
+/// solid UI freeze in one shot, worse than the throttled trickle it was
+/// meant to replace, and long enough that the "Syncing plugins…" status
+/// text would never even get a chance to redraw. These are ~12x the live
+/// caps: generous enough to replace ~150 throttled ticks with ~12-15, while
+/// keeping each individual tick's blocking work down to a few hundred ms so
+/// the UI keeps redrawing (and the sync percentage keeps visibly moving)
+/// throughout the catch-up instead of locking up once for the whole thing.
+const FAST_MAX_PER_SYNC: u64 = 6_000;
+const FAST_MAX_PACKETS_PER_SYNC: u64 = 50_000;
+
 /// Feed newly-completed top-level items to `plugin_manager`, bounded so a
 /// single call never blocks the main loop for long even when a huge item
 /// becomes available all at once, and return a freshly rebuilt device list
@@ -43,16 +58,32 @@ const MAX_PACKETS_PER_SYNC: u64 = 4000;
 /// `pending_offset` carries, for `*last_synced`, how many of its
 /// transactions have already been fed to plugins across calls, for when an
 /// item is too big to finish in one call's packet budget.
+///
+/// `fast`, when true, switches to the much larger [`FAST_MAX_PER_SYNC`]/
+/// [`FAST_MAX_PACKETS_PER_SYNC`] caps instead of the default (tight) ones.
+/// The tight caps exist to keep the UI responsive during a *live*,
+/// open-ended capture, where new items keep arriving indefinitely and a
+/// slow trickle-in is actually fine. Replaying an already-loaded file is
+/// different: the data is finite and already fully decoded (or decoding as
+/// fast as disk I/O allows), so there's no reason to throttle the plugin
+/// pane's catch-up to it nearly as hard — callers pass `fast: true`
+/// whenever the session isn't a live capture.
 pub fn sync(
     store: &mut ItemStore,
     plugin_manager: &mut PluginManager,
     last_synced: &mut u64,
     pending_offset: &mut u64,
+    fast: bool,
 ) -> Result<Vec<UsbDeviceInfo>> {
     let devices = build_usb_devices(store)?;
 
-    let item_limit = store.item_count().min(*last_synced + MAX_PER_SYNC);
-    let mut packet_budget = MAX_PACKETS_PER_SYNC;
+    let (max_per_sync, max_packets_per_sync) = if fast {
+        (FAST_MAX_PER_SYNC, FAST_MAX_PACKETS_PER_SYNC)
+    } else {
+        (MAX_PER_SYNC, MAX_PACKETS_PER_SYNC)
+    };
+    let item_limit = store.item_count().min(last_synced.saturating_add(max_per_sync));
+    let mut packet_budget = max_packets_per_sync;
 
     while *last_synced < item_limit {
         if packet_budget == 0 {

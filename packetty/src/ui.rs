@@ -149,7 +149,19 @@ fn draw_capture(f: &mut Frame, main: Rect, status: Rect, app: &mut App) {
     } else if !app.search_query.is_empty() && app.search_matches.is_empty() {
         format!("/{} [no matches]", app.search_query)
     } else if let Some(ref name) = app.load_label {
-        format!("Loaded: {name}")
+        if app.is_loading() {
+            match app.load_progress() {
+                Some(frac) => format!("Loading {name}…  {:.0}%", frac * 100.0),
+                None => format!("Loading {name}…"),
+            }
+        } else if app.is_syncing_plugins() {
+            match app.plugin_sync_progress() {
+                Some(frac) => format!("Loaded: {name}  —  Syncing plugins…  {:.0}%", frac * 100.0),
+                None => format!("Loaded: {name}  —  Syncing plugins…"),
+            }
+        } else {
+            format!("Loaded: {name}")
+        }
     } else if app.is_saving() {
         let name = app.save_label().unwrap_or("capture.pcapng");
         format!("● Saving → {name}")
