@@ -56,6 +56,15 @@ pub struct App {
     pub scroll_offset: usize,
     /// Number of visible rows (updated each draw; used for page nav).
     pub page_size: usize,
+    /// `true` when the "Details" pane has keyboard focus instead of the
+    /// transactions list, toggled with `d`. While set, the usual
+    /// navigation keys (arrows, Page Up/Down, Ctrl+d/u, g/G) scroll the
+    /// details pane's raw-bytes preview instead of moving the selection.
+    pub details_focus: bool,
+    /// Scroll offset (in rendered lines) into the details pane.
+    pub details_scroll: usize,
+    /// Visible height of the details pane (updated each draw; used for page nav).
+    pub details_page_size: usize,
 
     // Device view
     pub usb_devices: Vec<UsbDeviceInfo>,
@@ -135,6 +144,9 @@ impl App {
             selected_row: None,
             scroll_offset: 0,
             page_size: 30,
+            details_focus: false,
+            details_scroll: 0,
+            details_page_size: 30,
             usb_devices: Vec::new(),
             device_expanded: HashMap::new(),
             device_selected: 0,
@@ -183,6 +195,8 @@ impl App {
         self.device_expanded.clear();
         self.selected_row = None;
         self.scroll_offset = 0;
+        self.details_focus = false;
+        self.details_scroll = 0;
         self.device_selected = 0;
         self.device_scroll = 0;
         self.search_mode = false;
@@ -482,6 +496,17 @@ impl App {
     }
 
     fn handle_traffic_nav(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('d') && key.modifiers.is_empty() {
+            self.details_focus = !self.details_focus;
+            self.g_pending = false;
+            return;
+        }
+
+        if self.details_focus {
+            self.handle_details_nav(key);
+            return;
+        }
+
         let len = self.flat_len();
 
         let is_g = key.code == KeyCode::Char('g') && key.modifiers.is_empty();
@@ -497,6 +522,9 @@ impl App {
         }
 
         let page = self.page_size.max(1);
+        // Selecting a different row invalidates any scroll into the previous
+        // row's details preview.
+        self.details_scroll = 0;
 
         match key.code {
             KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() || key.code == KeyCode::Up => {
@@ -594,6 +622,58 @@ impl App {
                         self.clamp_scroll(new_len);
                     }
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Navigation while the details pane has focus (`d` toggles into/out of
+    /// this mode): the usual movement keys scroll the raw-bytes preview
+    /// instead of moving the transactions-list selection.
+    fn handle_details_nav(&mut self, key: KeyEvent) {
+        let page = self.details_page_size.max(1);
+
+        let is_g = key.code == KeyCode::Char('g') && key.modifiers.is_empty();
+        if !is_g {
+            self.g_pending = false;
+        }
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() || key.code == KeyCode::Up => {
+                self.details_scroll = self.details_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() || key.code == KeyCode::Down => {
+                self.details_scroll = self.details_scroll.saturating_add(1);
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let half = (page / 2).max(1);
+                self.details_scroll = self.details_scroll.saturating_add(half);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let half = (page / 2).max(1);
+                self.details_scroll = self.details_scroll.saturating_sub(half);
+            }
+            KeyCode::PageDown | KeyCode::Char('f')
+                if key.modifiers.contains(KeyModifiers::CONTROL) || key.code == KeyCode::PageDown =>
+            {
+                self.details_scroll = self.details_scroll.saturating_add(page);
+            }
+            KeyCode::PageUp | KeyCode::Char('b')
+                if key.modifiers.contains(KeyModifiers::CONTROL) || key.code == KeyCode::PageUp =>
+            {
+                self.details_scroll = self.details_scroll.saturating_sub(page);
+            }
+            KeyCode::Char('g') if key.modifiers.is_empty() => {
+                if self.g_pending {
+                    self.details_scroll = 0;
+                    self.g_pending = false;
+                } else {
+                    self.g_pending = true;
+                }
+                return;
+            }
+            KeyCode::Char('G') => {
+                self.details_scroll = usize::MAX / 2;
             }
             _ => {}
         }
@@ -1014,8 +1094,9 @@ impl App {
         self.items.as_mut()?.row_details(ti as u64, ci.map(|c| c as u64)).ok()
     }
 
-    /// Raw bytes for the currently selected row (for hex+ASCII dump in detail pane).
-    pub fn selected_raw_bytes(&mut self) -> Option<Vec<u8>> {
+    /// Raw bytes for the currently selected row (for hex+ASCII dump in detail
+    /// pane), plus whether the dump was cut short of the row's full contents.
+    pub fn selected_raw_bytes(&mut self) -> Option<(Vec<u8>, bool)> {
         let flat_idx = self.selected_row?;
         let (ti, ci) = self.resolve(flat_idx)?;
         self.items.as_mut()?.row_raw_bytes(ti as u64, ci.map(|c| c as u64)).ok().flatten()

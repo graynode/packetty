@@ -408,28 +408,39 @@ impl ItemStore {
     /// number of packets (a long isochronous stream, say) can't turn
     /// "navigate onto this row" into a multi-second stall just to build a
     /// hex-dump preview of it.
-    pub fn row_raw_bytes(&mut self, top_idx: u64, child_idx: Option<u64>) -> Result<Option<Vec<u8>>> {
+    ///
+    /// The returned `bool` is `true` when the preview was cut short by
+    /// either cap, so the UI can tell the user the dump isn't the whole
+    /// packet/transfer.
+    pub fn row_raw_bytes(&mut self, top_idx: u64, child_idx: Option<u64>) -> Result<Option<(Vec<u8>, bool)>> {
         match child_idx {
             Some(ci) => {
                 let packet_id = self.cached_child(top_idx, ci)?.context("packet index out of range")?;
                 let bytes = self.reader.packet(packet_id)?;
-                Ok(if bytes.is_empty() { None } else { Some(bytes) })
+                Ok(if bytes.is_empty() { None } else { Some((bytes, false)) })
             }
             None => {
                 let item = self.top_item(top_idx)?;
-                let packets: Vec<PacketId> = match self.expanded.get(&top_idx) {
-                    Some((cached, _)) => cached.iter().take(RAW_BYTES_PACKET_CAP as usize).copied().collect(),
-                    None => item::flatten_packets_capped(&mut self.reader, &item, RAW_BYTES_PACKET_CAP)?.0,
+                let (packets, mut truncated): (Vec<PacketId>, bool) = match self.expanded.get(&top_idx) {
+                    Some((cached, expand_truncated)) => (
+                        cached.iter().take(RAW_BYTES_PACKET_CAP as usize).copied().collect(),
+                        *expand_truncated || cached.len() as u64 > RAW_BYTES_PACKET_CAP,
+                    ),
+                    None => item::flatten_packets_capped(&mut self.reader, &item, RAW_BYTES_PACKET_CAP)?,
                 };
                 let mut all = Vec::new();
                 for pid in packets {
                     if all.len() >= RAW_BYTES_TOTAL_CAP {
+                        truncated = true;
                         break;
                     }
                     all.extend(self.reader.packet(pid)?);
                 }
-                all.truncate(RAW_BYTES_TOTAL_CAP);
-                Ok(if all.is_empty() { None } else { Some(all) })
+                if all.len() > RAW_BYTES_TOTAL_CAP {
+                    truncated = true;
+                    all.truncate(RAW_BYTES_TOTAL_CAP);
+                }
+                Ok(if all.is_empty() { None } else { Some((all, truncated)) })
             }
         }
     }

@@ -175,9 +175,10 @@ fn draw_capture(f: &mut Frame, main: Rect, status: Rect, app: &mut App) {
         format!("-/{total_rows}")
     };
     let hint = format!(
-        "Tab=views  {}  o=open  j/k=↑↓  Ctrl+d/u=½pg  G/gg=last/first  {}  q=quit  txns={}  pkts={}  [{}]",
+        "Tab=views  {}  o=open  j/k=↑↓  Ctrl+d/u=½pg  G/gg=last/first  {}{}  q=quit  txns={}  pkts={}  [{}]",
         if app.load_label.is_some() { "/=search  n/p=next/prev  s=capture  Ctrl+S=save" } else { "s=speed  Ctrl+S=save" },
-        if app.load_label.is_none() { "h/l=←→" } else { "" },
+        if app.load_label.is_none() { "h/l=←→  " } else { "" },
+        if app.active_view == ActiveView::Traffic { "d=focus details" } else { "" },
         app.transaction_count(),
         app.packet_count(),
         pos_str,
@@ -234,9 +235,18 @@ fn draw_traffic_view(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_packet_tree(f: &mut Frame, area: Rect, app: &mut App) {
+    let focused = !app.details_focus;
+    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+    let title_style = if focused {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     let block = Block::default()
         .title(" Transactions ")
-        .borders(Borders::ALL);
+        .title_style(title_style)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
 
     // Reserve 2 rows for border.
     let inner_height = area.height.saturating_sub(2) as usize;
@@ -289,9 +299,19 @@ fn draw_packet_tree(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_packet_details(f: &mut Frame, area: Rect, app: &mut App) {
+    let focused = app.details_focus;
+    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+    let title_style = if focused {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let hint = if focused { "  ↑↓/PgUp/PgDn scroll  d=back" } else { "  d=focus" };
     let block = Block::default()
-        .title(" Details ")
-        .borders(Borders::ALL);
+        .title(format!(" Details{hint} "))
+        .title_style(title_style)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
 
     let text: Vec<Line> = if let Some((label, details)) = app.selected_details() {
         let mut lines = vec![
@@ -302,7 +322,7 @@ fn draw_packet_details(f: &mut Frame, area: Rect, app: &mut App) {
             lines.push(Line::from(part.to_owned()));
         }
         // Hex + ASCII dump of raw bytes.
-        if let Some(bytes) = app.selected_raw_bytes() {
+        if let Some((bytes, truncated)) = app.selected_raw_bytes() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("── Raw data ({} bytes) ──────────────────────", bytes.len()),
@@ -321,6 +341,12 @@ fn draw_packet_details(f: &mut Frame, area: Rect, app: &mut App) {
                     _ => lines.push(Line::from(dump_line.to_owned())),
                 }
             }
+            if truncated {
+                lines.push(Line::from(Span::styled(
+                    "── not all bytes shown (preview truncated) ──",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )));
+            }
         }
         lines
     } else {
@@ -338,8 +364,19 @@ fn draw_packet_details(f: &mut Frame, area: Rect, app: &mut App) {
         ]
     };
 
+    // Reserve 2 rows for border; keep details_page_size in sync so keyboard
+    // nav (Ctrl+d/u, PageUp/Down) uses the real visible height, and clamp
+    // the scroll offset now that we know the total line count.
+    let inner_height = area.height.saturating_sub(2) as usize;
+    app.details_page_size = inner_height;
+    let max_scroll = text.len().saturating_sub(inner_height.max(1));
+    app.details_scroll = app.details_scroll.min(max_scroll);
+
     f.render_widget(
-        Paragraph::new(text).block(block).wrap(Wrap { trim: true }),
+        Paragraph::new(text)
+            .block(block)
+            .wrap(Wrap { trim: true })
+            .scroll((app.details_scroll as u16, 0)),
         area,
     );
 }
